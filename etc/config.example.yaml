@@ -1,0 +1,68 @@
+# workq configuration: one file per instance (home, work).
+# Lives at /etc/workq/config.yaml, readable by the workq user only.
+
+# The queue repo, reached over SSH with the workq user's deploy key.
+repo_url: git@github.com:YOU/workq-queue.git
+# Azure DevOps: git@ssh.dev.azure.com:v3/ORG/PROJECT/workq-queue
+branch: main
+
+# Where the runner keeps its clones, locks, ledger and problem log.
+state_dir: /var/lib/workq
+
+# Base web address of the repo, for links in the digest.
+# GitHub:        https://github.com/YOU/workq-queue/tree/main
+# Azure DevOps:  https://dev.azure.com/ORG/PROJECT/_git/workq-queue?version=GBmain&path=
+web_url: https://github.com/YOU/workq-queue/tree/main
+
+# Leave empty to use the VM's time zone (set it with: timedatectl set-timezone Australia/Perth).
+timezone: Australia/Perth
+
+# The overnight shift. The night timer starts it at the start time; it stops by the end time.
+window:
+  start: "22:00"
+  end: "06:00"
+
+max_attempts: 3        # per stage, per round of review
+max_output_mb: 20      # largest out/ folder an executor may produce
+allow_web: true        # false removes WebSearch/WebFetch from every stage
+bash_allow: []         # e.g. ["python3 *"] lets executors run python3 for data work
+limit_wait_min: 30     # wait after a usage limit when the reset time can't be read
+
+claude:
+  agent_user: workq-agent                  # run Claude as this user; null runs it as workq
+  bin: claude                              # used only when agent_user is null; otherwise
+                                           # set CLAUDE_BIN in agent.env if claude isn't on PATH
+  wrapper: /opt/workq/bin/agent-claude     # loads the agent's token, then runs Claude
+  restricted: true                         # --restricted: file tools stay inside the repo
+  extra_args: []
+
+# Models behind each tier. Aliases follow the latest models; full model IDs pin them.
+models:
+  haiku: haiku
+  sonnet: sonnet
+  opus: opus
+
+# Limits per run. A plan may ask for less, never more.
+stages:
+  shape:       {tier: opus,   timeout_min: 15, max_turns: 30, budget_usd: 2.00}
+  exec-haiku:  {tier: haiku,  timeout_min: 20, max_turns: 30, budget_usd: 0.50}
+  exec-sonnet: {tier: sonnet, timeout_min: 45, max_turns: 60, budget_usd: 3.00}
+  exec-opus:   {tier: opus,   timeout_min: 60, max_turns: 80, budget_usd: 8.00}
+  check:       {tier: opus,   timeout_min: 20, max_turns: 30, budget_usd: 2.00}
+
+# Nightly caps per tier. Shape and check count against opus.
+# On a subscription the dollar figure is Claude Code's estimate, so the run count is the firmer limit.
+caps:
+  haiku:  {runs: 40, usd: 5}
+  sonnet: {runs: 20, usd: 20}
+  opus:   {runs: 15, usd: 30}
+
+digest:
+  to: you@example.com
+  from: workq@example.com
+  subject: workq digest
+  send_command: msmtp -t       # any command that reads a full message on stdin
+
+git:
+  author_name: workq
+  author_email: workq@example.com

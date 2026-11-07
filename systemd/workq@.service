@@ -1,0 +1,13 @@
+[Unit]
+Description=workq %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=workq
+Group=workq
+Environment=WORKQ_CONFIG=/etc/workq/config.yaml
+ExecStart=/opt/workq/bin/workq %i
+TimeoutStartSec=8h30min
+Nice=10

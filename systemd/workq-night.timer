@@ -1,0 +1,11 @@
+[Unit]
+Description=Start the workq overnight shift
+
+[Timer]
+OnCalendar=*-*-* 22:00
+Unit=workq@night.service
+# A VM that was off at 22:00 skips that night rather than running into the day.
+Persistent=false
+
+[Install]
+WantedBy=timers.target

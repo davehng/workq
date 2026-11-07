@@ -1,0 +1,17 @@
+#!/bin/bash
+# Runs Claude Code as the agent user. The runner calls it through sudo:
+#   sudo -n -H -u workq-agent /opt/workq/bin/agent-claude -p --model ... 
+# It only ever starts Claude (CLAUDE_BIN in agent.env, else `claude` on PATH),
+# loads the agent's own credentials, which the runner user cannot read,
+# and makes new files group-writable so the runner can tidy them up.
+set -euo pipefail
+umask 002
+ENV_FILE="${WORKQ_AGENT_ENV:-/etc/workq/agent.env}"
+if [[ -r "$ENV_FILE" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  . "$ENV_FILE"
+  set +a
+fi
+export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+exec "${CLAUDE_BIN:-claude}" "$@"

@@ -1,0 +1,1298 @@
+#!/usr/bin/env python3
+"""workq: a git-backed work queue run by scheduled Claude Code agents.
+
+Commands
+  workq init                 put the queue skeleton into an empty remote repo
+  workq add TITLE [-f FILE]  add a brief to inbox/
+  workq run STAGE            run one stage once (file, shape, exec-haiku,
+                             exec-sonnet, exec-opus, check)
+  workq night [--until HH:MM]  run the overnight shift
+  workq digest [--stdout]    build and send the morning email
+  workq status               show what is in each folder
+  workq pause | resume       add or remove the PAUSE file
+
+The agents only read and write files. This script does every git operation
+and every move between folders.
+"""
+
+import argparse
+import copy
+import datetime as dt
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+import yaml
+
+VERSION = "0.1.0"
+
+STAGES = ["file", "shape", "exec-haiku", "exec-sonnet", "exec-opus", "check"]
+TIERS = ["haiku", "sonnet", "opus"]
+SOURCE = {
+    "shape": "inbox",
+    "exec-haiku": "ready/haiku",
+    "exec-sonnet": "ready/sonnet",
+    "exec-opus": "ready/opus",
+    "check": "check",
+}
+# Files each kind of stage may write inside the item folder.
+OWNS = {
+    "shape": ["plan.md", "questions.md"],
+    "execute": ["result.md", "out/"],
+    "check": ["check.md"],
+}
+BASE_TOOLS = ["Read", "Glob", "Grep", "Write", "Edit"]
+WEB_TOOLS = ["WebSearch", "WebFetch"]
+DATED = re.compile(r"^\d{4}-\d{2}-\d{2}-")
+# Failures that are the setup's fault, not the item's: stop the shift, keep the attempt.
+# A failed run with no JSON result means Claude never started (bad flag, missing
+# binary, sudo refused). Sign-in errors come back as JSON, so match those by text.
+BROKEN_TEXT = re.compile(
+    r"invalid api key|authentication_error|not logged in|please run /login|oauth token (has )?expired",
+    re.I,
+)
+LIMIT_TEXT = re.compile(
+    r"usage limit|limit reached|hit your limit|rate.?limit|out of (extra )?usage|"
+    r"too many requests|overloaded",
+    re.I,
+)
+
+DEFAULTS = {
+    "repo_url": None,
+    "branch": "main",
+    "state_dir": "/var/lib/workq",
+    "web_url": "",
+    "timezone": None,
+    "window": {"start": "22:00", "end": "06:00"},
+    "max_attempts": 3,
+    "max_output_mb": 20,
+    "allow_web": True,
+    "bash_allow": [],
+    "limit_wait_min": 30,
+    "claude": {
+        "bin": "claude",
+        "agent_user": None,
+        "wrapper": "/opt/workq/bin/agent-claude",
+        "restricted": True,
+        "extra_args": [],
+    },
+    "models": {"haiku": "haiku", "sonnet": "sonnet", "opus": "opus"},
+    "stages": {
+        "file": {"timeout_min": 2},
+        "shape": {"tier": "opus", "timeout_min": 15, "max_turns": 30, "budget_usd": 2.0},
+        "exec-haiku": {"tier": "haiku", "timeout_min": 20, "max_turns": 30, "budget_usd": 0.5},
+        "exec-sonnet": {"tier": "sonnet", "timeout_min": 45, "max_turns": 60, "budget_usd": 3.0},
+        "exec-opus": {"tier": "opus", "timeout_min": 60, "max_turns": 80, "budget_usd": 8.0},
+        "check": {"tier": "opus", "timeout_min": 20, "max_turns": 30, "budget_usd": 2.0},
+    },
+    "caps": {
+        "haiku": {"runs": 40, "usd": 5.0},
+        "sonnet": {"runs": 20, "usd": 20.0},
+        "opus": {"runs": 15, "usd": 30.0},
+    },
+    "digest": {
+        "to": None,
+        "from": "workq@localhost",
+        "subject": "workq digest",
+        "send_command": "msmtp -t",
+    },
+    "git": {"author_name": "workq", "author_email": "workq@localhost"},
+}
+
+
+# ---------------------------------------------------------------- helpers
+
+
+class WorkqError(Exception):
+    pass
+
+
+def deep_merge(base, extra):
+    out = copy.deepcopy(base)
+    for key, value in (extra or {}).items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = deep_merge(out[key], value)
+        else:
+            out[key] = value
+    return out
+
+
+def load_config(path):
+    path = Path(path)
+    if not path.exists():
+        raise WorkqError(f"config not found: {path}")
+    cfg = deep_merge(DEFAULTS, yaml.safe_load(path.read_text()) or {})
+    if not cfg.get("repo_url"):
+        raise WorkqError("config: repo_url is required")
+    cfg["state_dir"] = Path(cfg["state_dir"])
+    return cfg
+
+
+def now(cfg):
+    if cfg.get("timezone"):
+        from zoneinfo import ZoneInfo
+
+        return dt.datetime.now(ZoneInfo(cfg["timezone"]))
+    return dt.datetime.now().astimezone()
+
+
+def hhmm(text):
+    hour, minute = text.split(":")
+    return int(hour), int(minute)
+
+
+def shift_id(cfg, at=None):
+    """Date of the most recent window start: the shift a run belongs to."""
+    at = at or now(cfg)
+    hour, minute = hhmm(cfg["window"]["start"])
+    start = at.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if at < start:
+        start -= dt.timedelta(days=1)
+    return start.date().isoformat()
+
+
+def shift_end(cfg, until=None):
+    at = now(cfg)
+    hour, minute = hhmm(until or cfg["window"]["end"])
+    end = at.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if end <= at:
+        end += dt.timedelta(days=1)
+    return end
+
+
+def slugify(text, limit=50):
+    slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    return (slug[:limit].strip("-")) or "item"
+
+
+def file_hash(path):
+    """Content hash plus modification time, so a rewrite with the same text still counts."""
+    path = Path(path)
+    if path.is_file():
+        return (hashlib.sha256(path.read_bytes()).hexdigest(), path.stat().st_mtime_ns)
+    return None
+
+
+def front_matter(text):
+    """Return (dict, body) from a markdown file with optional --- front matter."""
+    if text.startswith("---"):
+        parts = text.split("\n")
+        for i in range(1, len(parts)):
+            if parts[i].strip() == "---":
+                try:
+                    data = yaml.safe_load("\n".join(parts[1:i])) or {}
+                except yaml.YAMLError:
+                    data = {}
+                if not isinstance(data, dict):
+                    data = {}
+                return data, "\n".join(parts[i + 1:])
+    return {}, text
+
+
+def first_line(text):
+    _, body = front_matter(text)
+    for line in body.splitlines():
+        line = line.strip().lstrip("#").strip()
+        if line:
+            return line[:200]
+    return ""
+
+
+def title_of(item_dir):
+    brief = item_dir / "brief.md"
+    if brief.exists():
+        line = first_line(brief.read_text(errors="replace"))
+        if line:
+            return line
+    return item_dir.name
+
+
+def dir_size(path):
+    path = Path(path)
+    if not path.exists():
+        return 0
+    return sum(p.stat().st_size for p in path.rglob("*") if p.is_file())
+
+
+def log(msg):
+    stamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"{stamp} {msg}", flush=True)
+
+
+# ---------------------------------------------------------------- state files
+
+
+class State:
+    """Runner bookkeeping kept on the VM, outside the repo."""
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.dir = cfg["state_dir"]
+        self.dir.mkdir(parents=True, exist_ok=True)
+        (self.dir / "locks").mkdir(exist_ok=True)
+        (self.dir / "clones").mkdir(exist_ok=True)
+
+    def _append(self, name, record):
+        with open(self.dir / name, "a") as fh:
+            fh.write(json.dumps(record) + "\n")
+
+    def _read(self, name):
+        path = self.dir / name
+        if not path.exists():
+            return []
+        out = []
+        for line in path.read_text().splitlines():
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+        return out
+
+    def ledger_add(self, **record):
+        record.setdefault("at", now(self.cfg).isoformat())
+        record.setdefault("shift", shift_id(self.cfg))
+        self._append("ledger.jsonl", record)
+
+    def ledger(self):
+        return self._read("ledger.jsonl")
+
+    def problem(self, stage, item, text):
+        log(f"PROBLEM [{stage}] {item or '-'}: {text}")
+        self._append(
+            "problems.jsonl",
+            {"at": now(self.cfg).isoformat(), "stage": stage, "item": item, "problem": text},
+        )
+
+    def problems_since(self, since):
+        return [p for p in self._read("problems.jsonl") if p["at"] > since]
+
+    def spend(self, tier, shift=None):
+        shift = shift or shift_id(self.cfg)
+        rows = [r for r in self.ledger() if r.get("shift") == shift and r.get("tier") == tier]
+        return len(rows), sum(float(r.get("cost") or 0) for r in rows)
+
+    def limit_until(self):
+        path = self.dir / "limit_until"
+        if path.exists():
+            try:
+                return float(path.read_text().strip())
+            except ValueError:
+                return 0.0
+        return 0.0
+
+    def set_limit_until(self, epoch):
+        (self.dir / "limit_until").write_text(str(epoch))
+
+    def last_digest(self):
+        path = self.dir / "last_digest"
+        return path.read_text().strip() if path.exists() else ""
+
+    def set_last_digest(self, stamp):
+        (self.dir / "last_digest").write_text(stamp)
+
+
+class Lock:
+    def __init__(self, state, name):
+        self.path = state.dir / "locks" / f"{name}.lock"
+        self.fh = None
+
+    def __enter__(self):
+        self.fh = open(self.path, "w")
+        try:
+            fcntl.flock(self.fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            self.fh.close()
+            self.fh = None
+            return False
+        return True
+
+    def __exit__(self, *exc):
+        if self.fh:
+            fcntl.flock(self.fh, fcntl.LOCK_UN)
+            self.fh.close()
+
+
+# ---------------------------------------------------------------- git
+
+
+class Repo:
+    def __init__(self, cfg, path):
+        self.cfg = cfg
+        self.path = Path(path)
+        self.branch = cfg["branch"]
+        self.env = dict(os.environ)
+        self.env.update(
+            GIT_AUTHOR_NAME=cfg["git"]["author_name"],
+            GIT_AUTHOR_EMAIL=cfg["git"]["author_email"],
+            GIT_COMMITTER_NAME=cfg["git"]["author_name"],
+            GIT_COMMITTER_EMAIL=cfg["git"]["author_email"],
+            GIT_TERMINAL_PROMPT="0",
+        )
+
+    def git(self, *args, check=True, cwd=None):
+        proc = subprocess.run(
+            ["git", *args],
+            cwd=cwd or self.path,
+            env=self.env,
+            capture_output=True,
+            text=True,
+        )
+        if check and proc.returncode != 0:
+            raise WorkqError(f"git {' '.join(args)} failed: {proc.stderr.strip() or proc.stdout.strip()}")
+        return proc
+
+    def sync(self):
+        if not (self.path / ".git").exists():
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            if self.path.exists():
+                shutil.rmtree(self.path)
+            self.git("clone", "--quiet", "--branch", self.branch, self.cfg["repo_url"],
+                     str(self.path), cwd=self.path.parent)
+            self.git("config", "core.sharedRepository", "group")
+            self.git("config", "core.quotePath", "false")
+        self.git("fetch", "--quiet", "origin", self.branch)
+        self.git("reset", "--quiet", "--hard", f"origin/{self.branch}")
+        self.git("clean", "-qfdx")
+
+    def changes(self):
+        """Paths that differ from HEAD, including untracked files."""
+        proc = self.git("status", "--porcelain=v1", "-z", "-uall")
+        entries = proc.stdout.split("\0")
+        out = []
+        i = 0
+        while i < len(entries):
+            entry = entries[i]
+            i += 1
+            if not entry:
+                continue
+            code, path = entry[:2], entry[3:]
+            out.append((code, path))
+            if code[0] in "RC":  # rename/copy carries the old path next
+                out.append((code, entries[i]))
+                i += 1
+        return out
+
+    def revert(self, path):
+        tracked = self.git("ls-files", "--error-unmatch", "--", path, check=False).returncode == 0
+        if tracked:
+            self.git("checkout", "HEAD", "--", path)
+        else:
+            full = self.path / path
+            if full.is_dir():
+                shutil.rmtree(full, ignore_errors=True)
+            elif full.exists() or full.is_symlink():
+                full.unlink()
+
+    def commit(self, message):
+        self.git("add", "-A")
+        if self.git("diff", "--cached", "--quiet", check=False).returncode == 0:
+            return False
+        self.git("commit", "--quiet", "-m", message)
+        return True
+
+    def push(self):
+        for _ in range(4):
+            if self.git("push", "--quiet", "origin", f"HEAD:{self.branch}", check=False).returncode == 0:
+                return True
+            pull = self.git("pull", "--quiet", "--rebase", "origin", self.branch, check=False)
+            if pull.returncode != 0:
+                self.git("rebase", "--abort", check=False)
+                return False
+        return False
+
+    def move(self, src, dst):
+        """git mv, adding a suffix if the destination already exists."""
+        dst_path = self.path / dst
+        dst_path.parent.mkdir(parents=True, exist_ok=True)
+        n = 2
+        base = dst
+        while dst_path.exists():
+            dst = f"{base}-{n}"
+            dst_path = self.path / dst
+            n += 1
+        self.git("mv", src, dst)
+        return dst
+
+
+# ---------------------------------------------------------------- items
+
+
+def load_meta(item_dir):
+    path = item_dir / "meta.yaml"
+    if path.exists():
+        data = yaml.safe_load(path.read_text()) or {}
+    else:
+        data = {}
+    data.setdefault("id", item_dir.name)
+    data.setdefault("title", title_of(item_dir))
+    data.setdefault("tier", None)
+    data.setdefault("status", "active")
+    data.setdefault("history", [])
+    for key in ("shape_attempts", "execute_attempts", "check_attempts", "check_fails", "runs"):
+        data.setdefault(key, 0)
+    data.setdefault("cost_usd", 0.0)
+    return data
+
+
+def save_meta(item_dir, meta):
+    (item_dir / "meta.yaml").write_text(yaml.safe_dump(meta, sort_keys=False, allow_unicode=True))
+
+
+def note_move(cfg, meta, src, dst, note):
+    meta["history"].append(
+        {"at": now(cfg).isoformat(timespec="seconds"), "from": src, "to": dst, "note": note}
+    )
+
+
+def list_items(repo, folder):
+    base = repo.path / folder
+    if not base.exists():
+        return []
+    return sorted(p for p in base.iterdir() if p.is_dir() and not p.name.startswith("."))
+
+
+def tidy_inbox(cfg, repo, state):
+    """Turn loose briefs into dated item folders with meta.yaml."""
+    inbox = repo.path / "inbox"
+    if not inbox.exists():
+        return
+    today = now(cfg).date().isoformat()
+    changed = False
+    for entry in sorted(inbox.iterdir()):
+        if entry.name.startswith("."):
+            continue
+        if entry.is_file():
+            if entry.suffix.lower() not in (".md", ".txt"):
+                continue
+            name = f"{today}-{slugify(entry.stem)}"
+            folder, n = inbox / name, 2
+            while folder.exists():
+                folder, n = inbox / f"{name}-{n}", n + 1
+            folder.mkdir()
+            repo.git("mv", f"inbox/{entry.name}", f"inbox/{folder.name}/brief.md")
+            entry = folder
+            changed = True
+        if not (entry / "brief.md").exists():
+            state.problem("shape", entry.name, "inbox folder has no brief.md; skipped")
+            continue
+        if not DATED.match(entry.name):
+            new = repo.move(f"inbox/{entry.name}", f"inbox/{today}-{slugify(entry.name)}")
+            entry = repo.path / new
+            changed = True
+        if not (entry / "meta.yaml").exists():
+            meta = load_meta(entry)
+            note_move(cfg, meta, None, "inbox", "added")
+            save_meta(entry, meta)
+            changed = True
+    if changed and repo.commit("workq: tidy inbox"):
+        if not repo.push():
+            raise WorkqError("push failed while tidying inbox")
+
+
+def is_paused(repo):
+    return (repo.path / "PAUSE").exists()
+
+
+# ---------------------------------------------------------------- claude
+
+
+def stage_kind(stage):
+    return "execute" if stage.startswith("exec-") else stage
+
+
+def stage_tools(cfg, kind, plan=None):
+    """Tool names and allow-list entries for a stage, clamped to its ceiling."""
+    web = WEB_TOOLS if cfg["allow_web"] else []
+    bash = [f"Bash({p})" for p in cfg["bash_allow"]]
+    if kind == "shape":
+        ceiling = BASE_TOOLS
+    elif kind == "check":
+        ceiling = BASE_TOOLS + ([t for t in web if t == "WebFetch"])
+    else:
+        ceiling = BASE_TOOLS + web + bash
+    if kind == "execute" and plan and isinstance(plan.get("tools"), list):
+        asked = [str(t) for t in plan["tools"]]
+        allowed = [t for t in asked if t in ceiling]
+        for need in ("Read", "Write"):
+            if need not in allowed:
+                allowed.append(need)
+    else:
+        allowed = list(ceiling)
+    names = []
+    for entry in allowed:
+        name = entry.split("(")[0]
+        if name not in names:
+            names.append(name)
+    return names, allowed
+
+
+def clamp_number(value, ceiling):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return ceiling
+    return max(0.0, min(value, float(ceiling)))
+
+
+def parse_reset(text, cfg):
+    """Best guess at when a usage limit resets, as an epoch."""
+    match = re.search(r"\|(\d{10})\b", text)
+    if match:
+        return float(match.group(1))
+    match = re.search(r"resets?\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", text, re.I)
+    if match:
+        hour = int(match.group(1)) % 12 if match.group(3) else int(match.group(1))
+        if match.group(3) and match.group(3).lower() == "pm":
+            hour += 12
+        minute = int(match.group(2) or 0)
+        at = now(cfg)
+        reset = at.replace(hour=hour % 24, minute=minute, second=0, microsecond=0)
+        if reset <= at:
+            reset += dt.timedelta(days=1)
+        return reset.timestamp()
+    return time.time() + float(cfg["limit_wait_min"]) * 60
+
+
+def run_claude(cfg, repo, stage, item_rel, model, tools, max_turns, budget, timeout_s):
+    """Run one headless Claude Code session. Returns a dict describing the run."""
+    kind = stage_kind(stage)
+    prompt_file = repo.path / "prompts" / f"{kind}.md"
+    if not prompt_file.exists():
+        raise WorkqError(f"missing prompt file prompts/{kind}.md in the queue repo")
+    names, allowed = tools
+    ccfg = cfg["claude"]
+    cmd = []
+    if ccfg.get("agent_user"):
+        # The wrapper starts Claude itself; set CLAUDE_BIN in agent.env to change which one.
+        cmd += ["sudo", "-n", "-H", "-u", ccfg["agent_user"], ccfg["wrapper"]]
+    else:
+        cmd.append(ccfg["bin"])
+    cmd += [
+        "-p",
+        "--model", model,
+        "--output-format", "json",
+        "--permission-mode", "dontAsk",
+        "--no-session-persistence",
+        "--max-turns", str(int(max_turns)),
+        "--max-budget-usd", f"{budget:.2f}",
+        "--append-system-prompt", prompt_file.read_text(),
+    ]
+    if ccfg.get("restricted"):
+        cmd.append("--restricted")
+    cmd += [str(a) for a in ccfg.get("extra_args") or []]
+    # Variadic flags go last; the prompt goes in on stdin so they can't swallow it.
+    cmd += ["--tools", ",".join(names)]
+    cmd += ["--allowedTools", *allowed]
+    prompt = (
+        f"Stage: {kind}\n"
+        f"Work item folder: {item_rel}\n\n"
+        f"Do the {kind} stage for this one work item, following the stage instructions "
+        f"and CLAUDE.md. Write only the files this stage owns, inside that folder."
+    )
+    started = time.time()
+    proc = subprocess.Popen(
+        cmd,
+        cwd=repo.path,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    timed_out = False
+    try:
+        stdout, stderr = proc.communicate(prompt, timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+            stdout, stderr = proc.communicate(timeout=15)
+        except (subprocess.TimeoutExpired, ProcessLookupError):
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            stdout, stderr = proc.communicate()
+    result = {}
+    for line in reversed((stdout or "").strip().splitlines()):
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                result = json.loads(line)
+                break
+            except json.JSONDecodeError:
+                continue
+    if not result and (stdout or "").strip().startswith("{"):
+        try:
+            result = json.loads(stdout)
+        except json.JSONDecodeError:
+            result = {}
+    text = " ".join(
+        str(x) for x in (result.get("result", ""), result.get("api_error_status") or "", stderr or "", stdout if not result else "")
+    )
+    failed = timed_out or proc.returncode != 0 or bool(result.get("is_error"))
+    limited = failed and not timed_out and (
+        bool(LIMIT_TEXT.search(text)) or result.get("api_error_status") == 429
+    )
+    broken = failed and not timed_out and not limited and (
+        not result or bool(BROKEN_TEXT.search(text)) or result.get("api_error_status") in (401, 403)
+    )
+    return {
+        "cmd": cmd,
+        "broken": broken,
+        "returncode": proc.returncode,
+        "timed_out": timed_out,
+        "seconds": round(time.time() - started, 1),
+        "stdout": stdout or "",
+        "stderr": stderr or "",
+        "result": result,
+        "cost": float(result.get("total_cost_usd") or 0),
+        "turns": result.get("num_turns"),
+        "failed": failed,
+        "limited": limited,
+        "reset_at": parse_reset(text, cfg) if limited else None,
+        "summary": str(result.get("result", ""))[:300],
+    }
+
+
+# ---------------------------------------------------------------- stages
+
+
+def run_stage(cfg, stage):
+    """Run one stage once. Returns one of:
+    done, idle, paused, busy, capped, limited, broken, error."""
+    if stage not in STAGES:
+        raise WorkqError(f"unknown stage {stage}; use one of {', '.join(STAGES)}")
+    state = State(cfg)
+    with Lock(state, stage) as got:
+        if not got:
+            log(f"[{stage}] already running; skipped")
+            return "busy"
+        repo = Repo(cfg, state.dir / "clones" / stage)
+        try:
+            repo.sync()
+        except WorkqError as exc:
+            state.problem(stage, None, str(exc))
+            return "error"
+        if is_paused(repo):
+            log(f"[{stage}] PAUSE file present; skipped")
+            return "paused"
+        if stage == "file":
+            return file_stage(cfg, repo, state)
+        if state.limit_until() > time.time():
+            return "limited"
+        try:
+            return work_stage(cfg, repo, state, stage)
+        except WorkqError as exc:
+            state.problem(stage, None, str(exc))
+            return "error"
+
+
+def work_stage(cfg, repo, state, stage):
+    kind = stage_kind(stage)
+    if kind == "shape":
+        tidy_inbox(cfg, repo, state)
+    items = [p for p in list_items(repo, SOURCE[stage]) if (p / "brief.md").exists()]
+    if not items:
+        return "idle"
+    item = items[0]
+    item_rel = f"{SOURCE[stage]}/{item.name}"
+    scfg = cfg["stages"][stage]
+    tier = scfg["tier"]
+    cap = cfg["caps"][tier]
+    runs, usd = state.spend(tier)
+    if runs >= cap["runs"] or usd >= cap["usd"]:
+        log(f"[{stage}] {tier} cap reached ({runs} runs, ${usd:.2f}); skipped")
+        return "capped"
+
+    meta = load_meta(item)
+    attempts_key = f"{kind}_attempts"
+    plan = {}
+    if kind == "execute":
+        plan, _ = front_matter((item / "plan.md").read_text(errors="replace")) if (item / "plan.md").exists() else ({}, "")
+    max_turns = clamp_number(plan.get("max_turns", scfg["max_turns"]), scfg["max_turns"])
+    budget = clamp_number(plan.get("budget_usd", scfg["budget_usd"]), scfg["budget_usd"])
+    tools = stage_tools(cfg, kind, plan if kind == "execute" else None)
+
+    # Keep the previous check so the history survives the next one.
+    if kind == "check" and (item / "check.md").exists():
+        (item / "log").mkdir(exist_ok=True)
+        n = meta["check_attempts"]
+        shutil.copyfile(item / "check.md", item / "log" / f"check-{n}.md")
+
+    # Claim: count the attempt before the run, so a crash still counts.
+    meta[attempts_key] += 1
+    meta["running"] = {"stage": stage, "at": now(cfg).isoformat(timespec="seconds")}
+    save_meta(item, meta)
+    repo.commit(f"workq: {item.name} {stage} attempt {meta[attempts_key]}")
+    if not repo.push():
+        state.problem(stage, item.name, "could not push claim; will retry next pass")
+        return "error"
+
+    owned = OWNS[kind]
+    before = {name: file_hash(item / name) for name in owned if not name.endswith("/")}
+    log(f"[{stage}] {item.name}: running {cfg['models'][tier]} (attempt {meta[attempts_key]})")
+    run = run_claude(
+        cfg, repo, stage, item_rel, cfg["models"][tier], tools, max_turns, budget,
+        float(scfg["timeout_min"]) * 60,
+    )
+
+    # Save the raw output outside the repo first, then into the item's log/.
+    stamp = now(cfg).strftime("%Y%m%dT%H%M%S")
+    raw = {k: run[k] for k in ("returncode", "timed_out", "seconds", "result", "cmd")}
+    raw["stderr"] = run["stderr"][-4000:]
+    if not run["result"]:
+        raw["stdout"] = run["stdout"][-4000:]
+
+    def settle_meta():
+        # meta.yaml on disk is the claim version (the guard restores it if touched).
+        m = load_meta(item)
+        m.pop("running", None)
+        m["runs"] += 1
+        m["cost_usd"] = round(float(m["cost_usd"]) + run["cost"], 4)
+        return m
+
+    if run["broken"]:
+        # Claude didn't start or can't sign in: not the item's fault. Undo, give the
+        # attempt back, and stop rather than burn every item into blocked/.
+        for _, path in repo.changes():
+            repo.revert(path)
+        meta = settle_meta()
+        meta[attempts_key] = max(0, meta[attempts_key] - 1)
+        save_meta(item, meta)
+        write_log(item, stamp, stage, raw)
+        detail = (run["summary"] or run["stderr"] or run["stdout"]).strip()[-300:]
+        state.ledger_add(stage=stage, tier=tier, item=item.name, cost=run["cost"],
+                         turns=run["turns"], outcome="broken", reason=detail)
+        state.problem(stage, item.name, f"Claude Code failed to run; shift stopped: {detail}")
+        repo.commit(f"workq: {item.name} {stage} could not run claude")
+        repo.push()
+        return "broken"
+
+    if run["limited"]:
+        # Not the item's fault: undo everything and give the attempt back.
+        for _, path in repo.changes():
+            repo.revert(path)
+        meta = settle_meta()
+        meta[attempts_key] = max(0, meta[attempts_key] - 1)
+        save_meta(item, meta)
+        write_log(item, stamp, stage, raw)
+        state.set_limit_until(run["reset_at"])
+        state.ledger_add(stage=stage, tier=tier, item=item.name, cost=run["cost"],
+                         turns=run["turns"], outcome="limited", reason=run["summary"])
+        state.problem(stage, item.name, "usage limit hit; stage paused until "
+                      + dt.datetime.fromtimestamp(run["reset_at"]).strftime("%H:%M"))
+        repo.commit(f"workq: {item.name} {stage} stopped by usage limit")
+        repo.push()
+        return "limited"
+
+    # Guard: anything outside the stage's own files is thrown away.
+    violations = []
+    for _, path in repo.changes():
+        if not path.startswith(item_rel + "/"):
+            violations.append(path)
+            continue
+        rel = path[len(item_rel) + 1:]
+        if not any(rel == o or (o.endswith("/") and rel.startswith(o)) for o in owned):
+            violations.append(path)
+    for path in sorted(set(violations)):
+        repo.revert(path)
+    meta = settle_meta()
+
+    outcome, dst, reason = decide(cfg, repo, item, item_rel, kind, meta, before, run, violations)
+
+    write_log(item, stamp, stage, raw)
+    if dst and dst != item_rel:
+        if dst.startswith("blocked/"):
+            meta["status"] = "blocked"
+            meta["blocked_reason"] = reason
+        note_move(cfg, meta, SOURCE[stage], dst.rsplit("/", 1)[0], reason)
+        save_meta(item, meta)
+        new_rel = repo.move(item_rel, dst)
+        log(f"[{stage}] {item.name}: {outcome} -> {new_rel} ({reason})")
+    else:
+        save_meta(item, meta)
+        log(f"[{stage}] {item.name}: {outcome}, stays ({reason})")
+    repo.commit(f"workq: {item.name} {stage}: {outcome} ({reason})"[:200])
+    if not repo.push():
+        state.problem(stage, item.name, "push clashed; result dropped, item left for the next pass")
+    state.ledger_add(stage=stage, tier=tier, item=item.name, cost=run["cost"], turns=run["turns"],
+                     outcome=outcome, reason=reason, seconds=run["seconds"])
+    if outcome == "failed":  # blocked items have their own section in the digest
+        state.problem(stage, item.name, f"failed: {reason}")
+    return "done"
+
+
+def write_log(item, stamp, stage, raw):
+    logdir = item / "log"
+    logdir.mkdir(exist_ok=True)
+    (logdir / f"{stamp}-{stage}.json").write_text(json.dumps(raw, indent=2, default=str))
+
+
+def revert_owned(repo, item_rel):
+    """Throw away what a failed run wrote, keeping meta.yaml and log/."""
+    for _, path in repo.changes():
+        if not path.startswith(item_rel + "/"):
+            continue
+        rel = path[len(item_rel) + 1:]
+        if rel != "meta.yaml" and not rel.startswith("log/"):
+            repo.revert(path)
+
+
+def decide(cfg, repo, item, item_rel, kind, meta, before, run, violations):
+    """Work out where the item goes. Returns (outcome, destination or None, reason)."""
+    max_attempts = int(cfg["max_attempts"])
+    attempts = meta[f"{kind}_attempts"]
+
+    def fail(reason):
+        revert_owned(repo, item_rel)
+        if attempts >= max_attempts:
+            return "blocked", f"blocked/{item.name}", f"{kind} failed {attempts} times; last: {reason}"
+        return "failed", None, reason
+
+    if run["timed_out"]:
+        return fail("run hit its time limit")
+    if violations:
+        shown = ", ".join(sorted(set(violations))[:5])
+        return fail(f"wrote files it does not own: {shown}")
+    if run["failed"] and not run["result"]:
+        return fail(f"claude exited {run['returncode']}: {(run['stderr'] or run['stdout'])[-300:].strip()}")
+
+    if kind == "shape":
+        q_changed = file_hash(item / "questions.md") != before.get("questions.md")
+        p_changed = file_hash(item / "plan.md") != before.get("plan.md")
+        if q_changed and (item / "questions.md").exists():
+            if p_changed:
+                repo.revert(f"{item_rel}/plan.md")
+            return "blocked", f"blocked/{item.name}", "shaper has questions"
+        if p_changed and (item / "plan.md").exists():
+            fm, _ = front_matter((item / "plan.md").read_text(errors="replace"))
+            tier = str(fm.get("tier", "")).strip().lower()
+            if tier in TIERS:
+                meta["tier"] = tier
+                return "shaped", f"ready/{tier}/{item.name}", f"plan written, tier {tier}"
+            return fail(f"plan.md has no valid tier (got {tier or 'none'})")
+        return fail(f"no plan.md or questions.md written ({run['summary'][:120]})")
+
+    if kind == "execute":
+        if file_hash(item / "result.md") == before.get("result.md") or not (item / "result.md").exists():
+            return fail(f"no new result.md ({run['summary'][:120]})")
+        limit = float(cfg["max_output_mb"]) * 1024 * 1024
+        if dir_size(item / "out") > limit:
+            return fail(f"out/ is over {cfg['max_output_mb']} MB")
+        fm, _ = front_matter((item / "result.md").read_text(errors="replace"))
+        if fm.get("replan") is True or str(fm.get("replan", "")).lower() == "true":
+            return "replan", f"inbox/{item.name}", "executor asked for a new plan"
+        return "executed", f"check/{item.name}", f"result written at {meta.get('tier')}"
+
+    if kind == "check":
+        if file_hash(item / "check.md") == before.get("check.md") or not (item / "check.md").exists():
+            return fail(f"no new check.md ({run['summary'][:120]})")
+        fm, _ = front_matter((item / "check.md").read_text(errors="replace"))
+        verdict = str(fm.get("verdict", "")).strip().lower()
+        if verdict == "pass":
+            meta["status"] = "review"
+            return "passed", f"review/{item.name}", "check passed"
+        if verdict != "fail":
+            return fail(f"check.md verdict must be pass or fail (got {verdict or 'none'})")
+        meta["check_fails"] += 1
+        tier = meta.get("tier") or "sonnet"
+        if meta["execute_attempts"] >= max_attempts:
+            return "blocked", f"blocked/{item.name}", f"check failed; {meta['execute_attempts']} execute attempts used"
+        if meta["check_fails"] == 1:
+            return "check-failed", f"ready/{tier}/{item.name}", f"check failed; retry at {tier}"
+        nxt = TIERS.index(tier) + 1 if tier in TIERS else len(TIERS)
+        if nxt >= len(TIERS):
+            return "blocked", f"blocked/{item.name}", "check failed at opus"
+        meta["tier"] = TIERS[nxt]
+        return "check-failed", f"ready/{TIERS[nxt]}/{item.name}", f"check failed again; step up to {TIERS[nxt]}"
+    raise WorkqError(f"unknown kind {kind}")
+
+
+VERDICTS = {"review": {"approve", "rework", "reject"}, "blocked": {"retry", "reject", "rework"}}
+
+
+def read_verdict(path):
+    text = path.read_text(errors="replace")
+    fm, body = front_matter(text)
+    verdict = str(fm.get("verdict", "")).strip().lower()
+    if not verdict:
+        match = re.search(r"^\s*verdict\s*:\s*(\w+)", text, re.I | re.M)
+        if match:
+            verdict = match.group(1).lower()
+            body = re.sub(r"^\s*verdict\s*:.*$", "", body, count=1, flags=re.I | re.M)
+    return verdict, body.strip()
+
+
+def file_stage(cfg, repo, state):
+    did = False
+    for folder in ("review", "blocked"):
+        for item in list_items(repo, folder):
+            review = item / "review.md"
+            if not review.exists():
+                continue
+            if not (item / "meta.yaml").exists():
+                state.problem("file", item.name, f"{folder}/{item.name} is not a work item "
+                              "(no meta.yaml); review.md left alone")
+                continue
+            verdict, notes = read_verdict(review)
+            if verdict not in VERDICTS[folder]:
+                state.problem("file", item.name, f"review.md verdict '{verdict}' not valid in {folder}/; "
+                              f"use one of {', '.join(sorted(VERDICTS[folder]))}")
+                continue
+            meta = load_meta(item)
+            stamp = now(cfg).strftime("%Y-%m-%d %H:%M")
+            with open(item / "notes.md", "a") as fh:
+                fh.write(f"\n## Your notes, {stamp} ({verdict})\n\n{notes or '(none)'}\n")
+            repo.git("rm", "--quiet", "-f", f"{folder}/{item.name}/review.md")
+            item_rel = f"{folder}/{item.name}"
+            if verdict in ("rework", "retry"):
+                for key in ("shape_attempts", "execute_attempts", "check_attempts", "check_fails"):
+                    meta[key] = 0
+                meta["status"] = "active"
+                meta.pop("blocked_reason", None)
+                note_move(cfg, meta, folder, "inbox", f"you asked for {verdict}")
+                save_meta(item, meta)
+                dst = repo.move(item_rel, f"inbox/{item.name}")
+            else:
+                meta["status"] = "approved" if verdict == "approve" else "rejected"
+                month = now(cfg).strftime("%Y-%m")
+                note_move(cfg, meta, folder, "archive", f"you chose {verdict}")
+                meta["archived"] = now(cfg).date().isoformat()
+                save_meta(item, meta)
+                dst = repo.move(item_rel, f"archive/{month}/{item.name}")
+                add_index_line(repo, meta, dst)
+            log(f"[file] {item.name}: {verdict} -> {dst}")
+            repo.commit(f"workq: {item.name} {verdict} -> {dst.split('/')[0]}")
+            if not repo.push():
+                state.problem("file", item.name, "push clashed; will retry next pass")
+                return "error"
+            did = True
+    return "done" if did else "idle"
+
+
+def add_index_line(repo, meta, dst):
+    index = repo.path / "archive" / "INDEX.md"
+    if not index.exists():
+        index.parent.mkdir(parents=True, exist_ok=True)
+        index.write_text(
+            "# Archive index\n\n"
+            "| Archived | Item | Title | Tier | Runs | Est. cost (USD) | Outcome |\n"
+            "| --- | --- | --- | --- | --- | --- | --- |\n"
+        )
+    title = str(meta.get("title", "")).replace("|", "/")
+    with open(index, "a") as fh:
+        fh.write(
+            f"| {meta.get('archived')} | [{meta['id']}]({dst[len('archive/'):]}) | {title} | "
+            f"{meta.get('tier') or '-'} | {meta.get('runs', 0)} | {float(meta.get('cost_usd') or 0):.2f} | "
+            f"{meta.get('status')} |\n"
+        )
+
+
+# ---------------------------------------------------------------- night
+
+
+def night(cfg, until=None, max_passes=100):
+    state = State(cfg)
+    with Lock(state, "night") as got:
+        if not got:
+            log("night shift already running")
+            return 0
+        end = shift_end(cfg, until)
+        log(f"night shift until {end:%Y-%m-%d %H:%M}")
+        for n in range(max_passes):
+            progress = False
+            stopped = False
+            for stage in STAGES:
+                while True:
+                    budget_s = float(cfg["stages"][stage]["timeout_min"]) * 60
+                    if now(cfg) + dt.timedelta(seconds=budget_s) > end:
+                        log(f"[{stage}] not enough time left before {end:%H:%M}")
+                        break
+                    status = run_stage(cfg, stage)
+                    if status == "done":
+                        progress = True
+                        continue
+                    if status == "limited":
+                        reset = dt.datetime.fromtimestamp(state.limit_until()).astimezone()
+                        if reset + dt.timedelta(seconds=budget_s) < end:
+                            wait = max(1.0, state.limit_until() - time.time())
+                            log(f"usage limit: sleeping until {reset:%H:%M}")
+                            time.sleep(wait)
+                            continue
+                        log("usage limit runs past the end of the shift; stopping")
+                        stopped = True
+                    if status in ("paused", "broken"):
+                        stopped = True
+                    break
+                if stopped:
+                    break
+            if stopped or not progress:
+                break
+        log(f"night shift over after {n + 1} pass(es)")
+        return 0
+
+
+# ---------------------------------------------------------------- digest
+
+
+def build_digest(cfg, repo, state):
+    web = cfg["web_url"].rstrip("/")
+
+    def link(rel):
+        return f"{web}/{rel}" if web else rel
+
+    since = state.last_digest() or "0000"
+    sid = shift_id(cfg)
+    lines = []
+    review = list_items(repo, "review")
+    blocked = list_items(repo, "blocked")
+    lines.append(f"workq digest, {now(cfg):%A %d %B %Y}")
+    lines.append(f"{len(review)} for review, {len(blocked)} blocked, "
+                 f"{len(list_items(repo, 'inbox'))} waiting in inbox")
+    if is_paused(repo):
+        lines.append("PAUSE file is set: nothing ran.")
+    lines.append("")
+
+    lines.append(f"FOR REVIEW ({len(review)})")
+    if not review:
+        lines.append("  nothing")
+    for item in review:
+        meta = load_meta(item)
+        entered = next((h["at"] for h in reversed(meta["history"]) if h.get("to") == "review"), None)
+        waited = ""
+        if entered:
+            days = (now(cfg) - dt.datetime.fromisoformat(entered)).days
+            waited = f", waiting {days} day{'s' if days != 1 else ''}" if days else ", new"
+        summary = first_line((item / "result.md").read_text(errors="replace")) if (item / "result.md").exists() else ""
+        lines.append(f"- {meta['title']} [{meta.get('tier') or '-'}{waited}]")
+        if summary:
+            lines.append(f"  {summary}")
+        lines.append(f"  {link('review/' + item.name)}")
+    lines.append("")
+
+    lines.append(f"BLOCKED ({len(blocked)})")
+    if not blocked:
+        lines.append("  nothing")
+    for item in blocked:
+        meta = load_meta(item)
+        lines.append(f"- {meta['title']}: {meta.get('blocked_reason', 'blocked')}")
+        if (item / "questions.md").exists():
+            _, body = front_matter((item / "questions.md").read_text(errors="replace"))
+            for q in [l for l in body.splitlines() if l.strip()][:4]:
+                lines.append(f"  {q.strip()[:160]}")
+        lines.append(f"  {link('blocked/' + item.name)}")
+    lines.append("")
+
+    grouped = {}
+    for p in state.problems_since(since):
+        key = (p["stage"], p.get("item") or "", p["problem"])
+        first, count = grouped.get(key, (p["at"], 0))
+        grouped[key] = (first, count + 1)
+    lines.append(f"PROBLEMS ({len(grouped)})")
+    if not grouped:
+        lines.append("  none")
+    for (stage, item_name, text), (first, count) in list(grouped.items())[-20:]:
+        times = f" (x{count})" if count > 1 else ""
+        lines.append(f"- {first[11:16]} [{stage}] {item_name} {text}{times}".replace("  ", " "))
+    lines.append("")
+
+    rows = [r for r in state.ledger() if r.get("shift") == sid]
+    lines.append(f"LAST NIGHT (shift {sid})")
+    if not rows:
+        lines.append("  no runs")
+    for tier in TIERS:
+        tier_rows = [r for r in rows if r.get("tier") == tier]
+        if not tier_rows:
+            continue
+        cost = sum(float(r.get("cost") or 0) for r in tier_rows)
+        cap = cfg["caps"][tier]
+        lines.append(f"- {tier}: {len(tier_rows)}/{cap['runs']} runs, est. ${cost:.2f}/${cap['usd']:.2f}")
+    outcomes = {}
+    for r in rows:
+        outcomes[r.get("outcome")] = outcomes.get(r.get("outcome"), 0) + 1
+    if outcomes:
+        lines.append("  outcomes: " + ", ".join(f"{k} {v}" for k, v in sorted(outcomes.items())))
+    lines.append("")
+    lines.append("Reply by adding review.md to an item folder: verdict approve, rework or reject "
+                 "(retry or reject in blocked/).")
+    return "\n".join(lines) + "\n"
+
+
+def digest(cfg, to_stdout=False):
+    state = State(cfg)
+    with Lock(state, "digest") as got:
+        if not got:
+            return 0
+        repo = Repo(cfg, state.dir / "clones" / "digest")
+        repo.sync()
+        body = build_digest(cfg, repo, state)
+        stamp = now(cfg).isoformat()
+        dcfg = cfg["digest"]
+        if to_stdout or not dcfg.get("to"):
+            print(body)
+            return 0
+        message = (
+            f"To: {dcfg['to']}\nFrom: {dcfg['from']}\n"
+            f"Subject: {dcfg['subject']} {now(cfg):%a %d %b}\n"
+            f"Date: {now(cfg):%a, %d %b %Y %H:%M:%S %z}\n"
+            "Content-Type: text/plain; charset=utf-8\n\n" + body
+        )
+        proc = subprocess.run(shlex.split(dcfg["send_command"]), input=message, text=True,
+                              capture_output=True)
+        if proc.returncode != 0:
+            state.problem("digest", None, f"send failed: {proc.stderr.strip()[:300]}")
+            print(body)
+            return 1
+        state.set_last_digest(stamp)
+        log(f"digest sent to {dcfg['to']}")
+        return 0
+
+
+# ---------------------------------------------------------------- small commands
+
+
+def tools_repo(cfg):
+    state = State(cfg)
+    repo = Repo(cfg, state.dir / "clones" / "tools")
+    return state, repo
+
+
+def cmd_init(cfg):
+    state, repo = tools_repo(cfg)
+    template = Path(__file__).resolve().parent.parent / "template"
+    if not template.exists():
+        raise WorkqError(f"template folder not found at {template}")
+    with Lock(state, "tools"):
+        work = Path(tempfile.mkdtemp(prefix="workq-init-"))
+        try:
+            probe = repo.git("ls-remote", cfg["repo_url"], check=False, cwd=work)
+            if probe.returncode != 0:
+                raise WorkqError(f"cannot reach {cfg['repo_url']}: {probe.stderr.strip()}")
+            if probe.stdout.strip():
+                raise WorkqError("remote repo is not empty; init only fills an empty repo")
+            repo.git("init", "--quiet", "-b", cfg["branch"], cwd=work)
+            shutil.copytree(template, work, dirs_exist_ok=True)
+            Repo(cfg, work).commit("workq: queue skeleton")
+            repo.git("remote", "add", "origin", cfg["repo_url"], cwd=work)
+            repo.git("push", "--quiet", "origin", f"HEAD:{cfg['branch']}", cwd=work)
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+    log(f"queue skeleton pushed to {cfg['repo_url']} ({cfg['branch']})")
+
+
+def cmd_add(cfg, title, file=None, text=None):
+    state, repo = tools_repo(cfg)
+    with Lock(state, "tools"):
+        repo.sync()
+        name = f"{now(cfg).date().isoformat()}-{slugify(title)}"
+        folder = repo.path / "inbox" / name
+        n = 2
+        while folder.exists():
+            folder = repo.path / "inbox" / f"{name}-{n}"
+            n += 1
+        folder.mkdir(parents=True)
+        body = Path(file).read_text() if file else (text or "")
+        (folder / "brief.md").write_text(f"# {title}\n\n{body.strip()}\n")
+        repo.commit(f"workq: add {folder.name}")
+        if not repo.push():
+            raise WorkqError("push failed")
+    log(f"added inbox/{folder.name}")
+
+
+def cmd_pause(cfg, on):
+    state, repo = tools_repo(cfg)
+    with Lock(state, "tools"):
+        repo.sync()
+        flag = repo.path / "PAUSE"
+        if on:
+            flag.write_text("Delete this file to let workq run again.\n")
+        elif flag.exists():
+            flag.unlink()
+        repo.commit("workq: pause" if on else "workq: resume")
+        if not repo.push():
+            raise WorkqError("push failed")
+    log("paused" if on else "resumed")
+
+
+def cmd_status(cfg):
+    state, repo = tools_repo(cfg)
+    with Lock(state, "tools"):
+        repo.sync()
+        if is_paused(repo):
+            print("PAUSED")
+        for folder in ["inbox", "ready/haiku", "ready/sonnet", "ready/opus", "check", "review", "blocked"]:
+            items = list_items(repo, folder)
+            print(f"{folder:14} {len(items)}")
+            for item in items:
+                print(f"    {item.name}")
+        archived = list((repo.path / "archive").glob("*/*/meta.yaml"))
+        print(f"{'archive':14} {len(archived)}")
+        sid = shift_id(cfg)
+        for tier in TIERS:
+            runs, usd = state.spend(tier, sid)
+            cap = cfg["caps"][tier]
+            print(f"tonight {tier:7} {runs}/{cap['runs']} runs, est. ${usd:.2f}/${cap['usd']:.2f}")
+        if state.limit_until() > time.time():
+            print("usage limit until", dt.datetime.fromtimestamp(state.limit_until()).strftime("%H:%M"))
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="workq", description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--config", default=os.environ.get("WORKQ_CONFIG", "/etc/workq/config.yaml"))
+    parser.add_argument("--version", action="version", version=VERSION)
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("init")
+    p = sub.add_parser("add")
+    p.add_argument("title")
+    p.add_argument("-f", "--file")
+    p.add_argument("-m", "--message")
+    p = sub.add_parser("run")
+    p.add_argument("stage", choices=STAGES)
+    p = sub.add_parser("night")
+    p.add_argument("--until", help="end time HH:MM (default: window end)")
+    p = sub.add_parser("digest")
+    p.add_argument("--stdout", action="store_true", help="print instead of sending")
+    sub.add_parser("status")
+    sub.add_parser("pause")
+    sub.add_parser("resume")
+    args = parser.parse_args(argv)
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)  # quiet exit when piped into head
+    os.umask(0o002)
+    try:
+        cfg = load_config(args.config)
+        if args.cmd == "init":
+            cmd_init(cfg)
+        elif args.cmd == "add":
+            cmd_add(cfg, args.title, args.file, args.message)
+        elif args.cmd == "run":
+            status = run_stage(cfg, args.stage)
+            log(f"[{args.stage}] {status}")
+            return 1 if status in ("error", "broken") else 0
+        elif args.cmd == "night":
+            return night(cfg, args.until)
+        elif args.cmd == "digest":
+            return digest(cfg, args.stdout)
+        elif args.cmd == "status":
+            cmd_status(cfg)
+        elif args.cmd in ("pause", "resume"):
+            cmd_pause(cfg, args.cmd == "pause")
+    except WorkqError as exc:
+        print(f"workq: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

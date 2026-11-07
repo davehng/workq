@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "deny": [
+      "Read(//etc/workq/**)",
+      "Read(//home/workq/**)",
+      "Read(//var/lib/workq/*.jsonl)",
+      "Read(//root/**)",
+      "Read(~/.ssh/**)",
+      "Bash(git:*)",
+      "Bash(curl:*)",
+      "Bash(wget:*)"
+    ],
+    "disableBypassPermissionsMode": "disable"
+  }
+}

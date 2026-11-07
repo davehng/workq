@@ -1,0 +1,3 @@
+# Lets the runner start Claude as the agent user, and nothing else.
+# Installed to /etc/sudoers.d/workq (mode 440).
+workq ALL=(workq-agent) NOPASSWD: /opt/workq/bin/agent-claude

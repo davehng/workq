@@ -1,0 +1,10 @@
+[Unit]
+Description=Send the workq morning digest
+
+[Timer]
+OnCalendar=*-*-* 06:30
+Unit=workq@digest.service
+Persistent=false
+
+[Install]
+WantedBy=timers.target

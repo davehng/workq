@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "deny": [
+      "Read(~/.ssh/**)",
+      "Read(~/.config/workq/**)",
+      "Read(~/.local/state/workq/*.jsonl)",
+      "Read(~/.git-credentials)",
+      "Read(~/.netrc)",
+      "Read(~/.msmtprc)",
+      "Read(~/.gnupg/**)",
+      "Read(~/.aws/**)",
+      "Read(~/.azure/**)",
+      "Read(~/.kube/**)",
+      "Read(//proc/**)",
+      "Bash(git:*)",
+      "Bash(ssh:*)",
+      "Bash(scp:*)",
+      "Bash(curl:*)",
+      "Bash(wget:*)"
+    ],
+    "disableBypassPermissionsMode": "disable"
+  }
+}

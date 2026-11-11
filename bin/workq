@@ -10,6 +10,9 @@ Commands
   workq digest [--stdout]    build and send the morning email
   workq status               show what is in each folder
   workq pause | resume       add or remove the PAUSE file
+  workq doctor [--live]      check this machine is set up to run workq
+  workq schedule show|on|off set up the timers without root (systemd user
+                             timers, or cron when those can't be used)
 
 The agents only read and write files. This script does every git operation
 and every move between folders.
@@ -18,7 +21,9 @@ and every move between folders.
 import argparse
 import copy
 import datetime as dt
+import email.utils
 import fcntl
+import getpass
 import hashlib
 import json
 import os
@@ -26,15 +31,28 @@ import re
 import shlex
 import shutil
 import signal
+import smtplib
+import ssl
+import stat
 import subprocess
 import sys
 import tempfile
 import time
+from email.message import EmailMessage
 from pathlib import Path
 
-import yaml
+PKG_DIR = Path(__file__).resolve().parent.parent
+try:
+    if os.environ.get("WORKQ_BUNDLED_YAML"):
+        raise ImportError("bundled copy asked for")
+    import yaml
+    YAML_SOURCE = "system PyYAML"
+except ImportError:  # no PyYAML on this machine: use the copy shipped in lib/
+    sys.path.insert(0, str(PKG_DIR / "lib"))
+    import yaml
+    YAML_SOURCE = "bundled PyYAML"
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 STAGES = ["file", "shape", "exec-haiku", "exec-sonnet", "exec-opus", "check"]
 TIERS = ["haiku", "sonnet", "opus"]
@@ -79,12 +97,22 @@ DEFAULTS = {
     "allow_web": True,
     "bash_allow": [],
     "limit_wait_min": 30,
+    "env": {},
+    "extra_shifts": [],
     "claude": {
         "bin": "claude",
         "agent_user": None,
         "wrapper": "/opt/workq/bin/agent-claude",
         "restricted": True,
+        "strict_mcp": True,
         "extra_args": [],
+        # The rest apply in single-user mode (agent_user is null).
+        "env_file": None,
+        "config_dir": None,
+        "settings": None,
+        "sandbox": "auto",
+        "sandbox_binds": [],
+        "pass_env": [],
     },
     "models": {"haiku": "haiku", "sonnet": "sonnet", "opus": "opus"},
     "stages": {
@@ -104,10 +132,25 @@ DEFAULTS = {
         "to": None,
         "from": "workq@localhost",
         "subject": "workq digest",
+        "at": "06:30",
         "send_command": "msmtp -t",
+        "smtp": {"host": None, "port": 587, "starttls": True, "ssl": False,
+                 "user": None, "password_file": None},
     },
-    "git": {"author_name": "workq", "author_email": "workq@localhost"},
+    "git": {"author_name": "workq", "author_email": "workq@localhost",
+            "ssh_key": None, "credential_file": None},
 }
+
+# Environment passed to Claude in single-user mode. Everything else is dropped,
+# so an agent never inherits things like SSH_AUTH_SOCK or cloud credentials.
+ENV_KEEP = {
+    "HOME", "PATH", "LANG", "LANGUAGE", "TZ", "USER", "LOGNAME", "SHELL", "TERM", "TMPDIR",
+    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
+    "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR",
+}
+ENV_KEEP_PREFIX = ("LC_", "ANTHROPIC_", "CLAUDE")
+CREDENTIAL_VARS = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
+                   "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY")
 
 
 # ---------------------------------------------------------------- helpers
@@ -127,6 +170,22 @@ def deep_merge(base, extra):
     return out
 
 
+def default_config_path():
+    """$WORKQ_CONFIG, else ~/.config/workq/config.yaml if present, else /etc/workq/config.yaml."""
+    if os.environ.get("WORKQ_CONFIG"):
+        return os.environ["WORKQ_CONFIG"]
+    base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    user = Path(base) / "workq" / "config.yaml"
+    return str(user) if user.exists() else "/etc/workq/config.yaml"
+
+
+def expand(path):
+    """Expand ~ and $VARS in a path from the config."""
+    if not path:
+        return path
+    return os.path.expanduser(os.path.expandvars(str(path)))
+
+
 def load_config(path):
     path = Path(path)
     if not path.exists():
@@ -134,8 +193,61 @@ def load_config(path):
     cfg = deep_merge(DEFAULTS, yaml.safe_load(path.read_text()) or {})
     if not cfg.get("repo_url"):
         raise WorkqError("config: repo_url is required")
-    cfg["state_dir"] = Path(cfg["state_dir"])
+    cfg["_config_path"] = str(path.resolve())
+    cfg["repo_url"] = expand(cfg["repo_url"]) if str(cfg["repo_url"]).startswith(("~", "$")) else cfg["repo_url"]
+    cfg["state_dir"] = Path(expand(cfg["state_dir"]))
+    ccfg = cfg["claude"]
+    for key in ("bin", "wrapper", "env_file", "config_dir", "settings"):
+        ccfg[key] = expand(ccfg.get(key))
+    ccfg["sandbox_binds"] = [expand(x) for x in ccfg.get("sandbox_binds") or []]
+    for key in ("ssh_key", "credential_file"):
+        cfg["git"][key] = expand(cfg["git"].get(key))
+    cfg["digest"]["smtp"] = cfg["digest"].get("smtp") or {}
+    cfg["digest"]["smtp"]["password_file"] = expand(cfg["digest"]["smtp"].get("password_file"))
+    # Clock times: YAML reads an unquoted 22:00 as the number 1320, so accept both.
+    cfg["window"] = {k: clock(v) for k, v in cfg["window"].items()}
+    cfg["digest"]["at"] = clock(cfg["digest"]["at"])
+    cfg["extra_shifts"] = [
+        {"start": clock(x["start"]), "until": clock(x["until"]), "digest": bool(x.get("digest", True))}
+        for x in cfg.get("extra_shifts") or []
+    ]
     return cfg
+
+
+def single_user(cfg):
+    """True when Claude runs as the same user as the runner (no agent_user)."""
+    return not cfg["claude"].get("agent_user")
+
+
+def apply_env(cfg):
+    """Set the config's env: values for this process, and make ~/.local/bin findable."""
+    for key, value in (cfg.get("env") or {}).items():
+        os.environ[str(key)] = expand(value)
+    parts = [x for x in os.environ.get("PATH", "/usr/bin:/bin").split(":") if x]
+    for extra in (str(Path.home() / ".local" / "bin"), "/usr/local/bin"):
+        if extra not in parts:
+            parts.append(extra)
+    os.environ["PATH"] = ":".join(parts)
+
+
+def read_env_file(path):
+    """KEY=VALUE lines; blank values, comments and a leading `export` are ignored."""
+    out = {}
+    if not path or not Path(path).is_file():
+        return out
+    for line in Path(path).read_text().splitlines():
+        line = line.strip()
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        if value:
+            out[key.strip()] = value
+    return out
 
 
 def now(cfg):
@@ -146,8 +258,24 @@ def now(cfg):
     return dt.datetime.now().astimezone()
 
 
+def clock(value):
+    """Normalise a clock time to "HH:MM". YAML turns an unquoted 22:00 into 1320."""
+    if isinstance(value, bool) or value is None:
+        raise WorkqError(f"config: bad clock time {value!r}; write it as \"22:00\"")
+    if isinstance(value, (int, float)):
+        hour, minute = divmod(int(value), 60)
+    else:
+        try:
+            hour, minute = (int(x) for x in str(value).strip().split(":")[:2])
+        except ValueError:
+            raise WorkqError(f"config: bad clock time {value!r}; write it as \"22:00\"")
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        raise WorkqError(f"config: bad clock time {value!r}; write it as \"22:00\"")
+    return f"{hour:02d}:{minute:02d}"
+
+
 def hhmm(text):
-    hour, minute = text.split(":")
+    hour, minute = clock(text).split(":")
     return int(hour), int(minute)
 
 
@@ -338,10 +466,21 @@ class Repo:
             GIT_COMMITTER_EMAIL=cfg["git"]["author_email"],
             GIT_TERMINAL_PROMPT="0",
         )
+        # Never run hooks or helper programs named in a clone an agent has worked in.
+        self.base = ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"]
+        if cfg["git"].get("ssh_key"):
+            self.env["GIT_SSH_COMMAND"] = (
+                "ssh -i %s -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new"
+                % shlex.quote(cfg["git"]["ssh_key"])
+            )
+        if cfg["git"].get("credential_file"):
+            # HTTPS with a token: one line, https://anything:TOKEN@host, in a file only you can read.
+            self.base += ["-c", "credential.helper=", "-c",
+                          "credential.helper=store --file=" + shlex.quote(cfg["git"]["credential_file"])]
 
     def git(self, *args, check=True, cwd=None):
         proc = subprocess.run(
-            ["git", *args],
+            [*self.base, *args],
             cwd=cwd or self.path,
             env=self.env,
             capture_output=True,
@@ -358,11 +497,40 @@ class Repo:
                 shutil.rmtree(self.path)
             self.git("clone", "--quiet", "--branch", self.branch, self.cfg["repo_url"],
                      str(self.path), cwd=self.path.parent)
-            self.git("config", "core.sharedRepository", "group")
+            if not single_user(self.cfg):
+                self.git("config", "core.sharedRepository", "group")
             self.git("config", "core.quotePath", "false")
         self.git("fetch", "--quiet", "origin", self.branch)
         self.git("reset", "--quiet", "--hard", f"origin/{self.branch}")
         self.git("clean", "-qfdx")
+
+    def lock_git(self, locked):
+        """Make .git read-only while an agent works in the clone, then writable again."""
+        gitdir = self.path / ".git"
+        paths = [str(gitdir)]
+        for root, dirs, files in os.walk(gitdir):
+            paths += [os.path.join(root, name) for name in dirs + files]
+        for path in paths:
+            if os.path.islink(path):
+                continue
+            try:
+                mode = stat.S_IMODE(os.lstat(path).st_mode)
+                os.chmod(path, (mode & ~0o222) if locked else (mode | 0o200))
+            except OSError:
+                pass
+
+    def git_fingerprint(self):
+        """Identity of .git, its config and its hooks, to spot a swapped or edited one."""
+        gitdir = self.path / ".git"
+        try:
+            st = os.lstat(gitdir)
+        except OSError:
+            return None
+        config = gitdir / "config"
+        digest = hashlib.sha256(config.read_bytes()).hexdigest() if config.is_file() else None
+        hooks = gitdir / "hooks"
+        names = tuple(sorted(x.name for x in hooks.iterdir())) if hooks.is_dir() else ()
+        return (st.st_ino, st.st_dev, stat.S_ISDIR(st.st_mode), digest, names)
 
     def changes(self):
         """Paths that differ from HEAD, including untracked files."""
@@ -563,6 +731,113 @@ def parse_reset(text, cfg):
     return time.time() + float(cfg["limit_wait_min"]) * 60
 
 
+def claude_env(cfg):
+    """Environment for the Claude process."""
+    ccfg = cfg["claude"]
+    if not single_user(cfg):
+        return dict(os.environ)  # sudo resets it; the wrapper loads the agent's own file
+    keep = set(ccfg.get("pass_env") or []) | {str(k) for k in (cfg.get("env") or {})}
+    env = {
+        k: v for k, v in os.environ.items()
+        if k in keep or k.upper() in ENV_KEEP or k.startswith(ENV_KEEP_PREFIX)
+    }
+    env.update(read_env_file(ccfg.get("env_file")))
+    if ccfg.get("config_dir"):
+        os.makedirs(ccfg["config_dir"], mode=0o700, exist_ok=True)
+        env["CLAUDE_CONFIG_DIR"] = ccfg["config_dir"]
+    env.setdefault("DISABLE_AUTOUPDATER", "1")
+    return env
+
+
+def settings_args(cfg):
+    """--settings with the deny rules file, passed as text so the file can stay hidden."""
+    path = cfg["claude"].get("settings")
+    if not path:
+        return []
+    try:
+        return ["--settings", json.dumps(json.loads(Path(path).read_text()))]
+    except (OSError, ValueError) as exc:
+        raise WorkqError(f"claude.settings: cannot use {path}: {exc}")
+
+
+def force_rmtree(path):
+    """Delete a folder tree even when parts of it were made read-only."""
+    for root, _dirs, _files in os.walk(path):
+        try:
+            os.chmod(root, 0o700)
+        except OSError:
+            pass
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def claude_exe(cfg):
+    """Full path of the Claude Code program in single-user mode, or None."""
+    return shutil.which(cfg["claude"]["bin"])
+
+
+_BWRAP_WORKS = None
+
+
+def bwrap_works():
+    global _BWRAP_WORKS
+    if _BWRAP_WORKS is None:
+        exe = shutil.which("bwrap")
+        _BWRAP_WORKS = False
+        if exe:
+            try:
+                probe = subprocess.run(
+                    [exe, "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "true"],
+                    capture_output=True, timeout=20,
+                )
+                _BWRAP_WORKS = probe.returncode == 0
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+    return _BWRAP_WORKS
+
+
+def sandbox_mode(cfg):
+    """"bwrap" or "off" for this machine and config."""
+    want = cfg["claude"].get("sandbox", "auto")
+    want = "auto" if want is True else "off" if want is False else str(want).lower()
+    if not single_user(cfg) or want in ("off", "none"):
+        return "off"
+    if bwrap_works():
+        return "bwrap"
+    if want == "bwrap":
+        raise WorkqError("claude.sandbox is bwrap, but bubblewrap is missing or not allowed to run here")
+    return "off"
+
+
+def sandbox_wrap(cfg, workdir, cmd):
+    """Wrap a command in bubblewrap. Inside, the whole system is read-only, and the
+    home folder, /tmp and the workq config and state are empty, apart from the
+    clone being worked on (writable, but with .git read-only) and Claude's own files."""
+    ccfg = cfg["claude"]
+    hidden = [str(Path.home()), "/tmp", "/var/tmp", f"/run/user/{os.getuid()}"]
+    for extra in (str(cfg["state_dir"]), str(Path(cfg["_config_path"]).parent)):
+        if not any(extra == h or extra.startswith(h + "/") for h in hidden):
+            hidden.append(extra)
+    hidden = [h for h in hidden if os.path.isdir(h)]
+
+    def is_hidden(path):
+        return any(path == h or path.startswith(h + "/") for h in hidden)
+
+    args = [shutil.which("bwrap"), "--die-with-parent", "--ro-bind", "/", "/",
+            "--dev", "/dev", "--proc", "/proc"]
+    for path in hidden:
+        args += ["--tmpfs", path]
+    exe_dir = str(Path(cmd[0]).resolve().parent)
+    for path in [exe_dir, *ccfg.get("sandbox_binds", [])]:
+        if is_hidden(path) and os.path.exists(path):
+            args += ["--ro-bind", path, path]
+    if ccfg.get("config_dir"):
+        args += ["--bind", ccfg["config_dir"], ccfg["config_dir"]]
+    workdir = str(workdir)
+    args += ["--bind", workdir, workdir, "--ro-bind", workdir + "/.git", workdir + "/.git",
+             "--chdir", workdir, "--"]
+    return args + cmd
+
+
 def run_claude(cfg, repo, stage, item_rel, model, tools, max_turns, budget, timeout_s):
     """Run one headless Claude Code session. Returns a dict describing the run."""
     kind = stage_kind(stage)
@@ -576,7 +851,9 @@ def run_claude(cfg, repo, stage, item_rel, model, tools, max_turns, budget, time
         # The wrapper starts Claude itself; set CLAUDE_BIN in agent.env to change which one.
         cmd += ["sudo", "-n", "-H", "-u", ccfg["agent_user"], ccfg["wrapper"]]
     else:
-        cmd.append(ccfg["bin"])
+        exe = claude_exe(cfg)
+        # Run the real file, so a sandbox only has to show Claude its own folder.
+        cmd.append(str(Path(exe).resolve()) if exe else ccfg["bin"])
     cmd += [
         "-p",
         "--model", model,
@@ -589,6 +866,9 @@ def run_claude(cfg, repo, stage, item_rel, model, tools, max_turns, budget, time
     ]
     if ccfg.get("restricted"):
         cmd.append("--restricted")
+    if ccfg.get("strict_mcp"):
+        cmd.append("--strict-mcp-config")
+    cmd += settings_args(cfg)
     cmd += [str(a) for a in ccfg.get("extra_args") or []]
     # Variadic flags go last; the prompt goes in on stdin so they can't swallow it.
     cmd += ["--tools", ",".join(names)]
@@ -599,16 +879,29 @@ def run_claude(cfg, repo, stage, item_rel, model, tools, max_turns, budget, time
         f"Do the {kind} stage for this one work item, following the stage instructions "
         f"and CLAUDE.md. Write only the files this stage owns, inside that folder."
     )
+    sandbox = sandbox_mode(cfg)
+    if sandbox == "bwrap":
+        cmd = sandbox_wrap(cfg, repo.path, cmd)
     started = time.time()
-    proc = subprocess.Popen(
-        cmd,
-        cwd=repo.path,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        start_new_session=True,
-    )
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=repo.path,
+            env=claude_env(cfg),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        # Counts as a broken setup: the attempt is given back and the shift stops.
+        return {
+            "cmd": cmd, "sandbox": sandbox, "broken": True, "returncode": 127, "timed_out": False,
+            "seconds": 0.0, "stdout": "", "stderr": f"cannot start Claude Code ({cmd[0]}): {exc}",
+            "result": {}, "cost": 0.0, "turns": None, "failed": True, "limited": False,
+            "reset_at": None, "summary": "",
+        }
     timed_out = False
     try:
         stdout, stderr = proc.communicate(prompt, timeout=timeout_s)
@@ -649,6 +942,7 @@ def run_claude(cfg, repo, stage, item_rel, model, tools, max_turns, budget, time
     )
     return {
         "cmd": cmd,
+        "sandbox": sandbox,
         "broken": broken,
         "returncode": proc.returncode,
         "timed_out": timed_out,
@@ -700,6 +994,8 @@ def run_stage(cfg, stage):
 
 def work_stage(cfg, repo, state, stage):
     kind = stage_kind(stage)
+    sandbox_mode(cfg)   # fail here, before anything is claimed, if the setup is wrong
+    settings_args(cfg)
     if kind == "shape":
         tidy_inbox(cfg, repo, state)
     items = [p for p in list_items(repo, SOURCE[stage]) if (p / "brief.md").exists()]
@@ -742,14 +1038,30 @@ def work_stage(cfg, repo, state, stage):
     owned = OWNS[kind]
     before = {name: file_hash(item / name) for name in owned if not name.endswith("/")}
     log(f"[{stage}] {item.name}: running {cfg['models'][tier]} (attempt {meta[attempts_key]})")
-    run = run_claude(
-        cfg, repo, stage, item_rel, cfg["models"][tier], tools, max_turns, budget,
-        float(scfg["timeout_min"]) * 60,
-    )
+    git_before = repo.git_fingerprint()
+    repo.lock_git(True)
+    try:
+        run = run_claude(
+            cfg, repo, stage, item_rel, cfg["models"][tier], tools, max_turns, budget,
+            float(scfg["timeout_min"]) * 60,
+        )
+    finally:
+        git_after = repo.git_fingerprint()
+        if git_after == git_before:
+            repo.lock_git(False)
+    if git_after != git_before:
+        # The agent swapped or edited .git. Run no git command in this clone again.
+        force_rmtree(repo.path)
+        state.ledger_add(stage=stage, tier=tier, item=item.name, cost=run["cost"],
+                         turns=run["turns"], outcome="tampered", reason="clone's .git changed")
+        state.problem(stage, item.name, "the agent changed the clone's .git folder; the clone was "
+                      "thrown away, the run failed and the shift stopped. Read the item's brief "
+                      "and files before running again")
+        return "broken"
 
     # Save the raw output outside the repo first, then into the item's log/.
     stamp = now(cfg).strftime("%Y%m%dT%H%M%S")
-    raw = {k: run[k] for k in ("returncode", "timed_out", "seconds", "result", "cmd")}
+    raw = {k: run[k] for k in ("returncode", "timed_out", "seconds", "result", "cmd", "sandbox")}
     raw["stderr"] = run["stderr"][-4000:]
     if not run["result"]:
         raw["stdout"] = run["stdout"][-4000:]
@@ -1129,6 +1441,46 @@ def build_digest(cfg, repo, state):
     return "\n".join(lines) + "\n"
 
 
+def send_mail(cfg, subject, body):
+    """Send one plain-text email. Returns None, or the error as text."""
+    dcfg = cfg["digest"]
+    msg = EmailMessage()
+    msg["To"] = dcfg["to"] if isinstance(dcfg["to"], str) else ", ".join(dcfg["to"])
+    msg["From"] = dcfg["from"]
+    msg["Subject"] = subject
+    msg["Date"] = email.utils.format_datetime(now(cfg))
+    msg.set_content(body)
+    smtp = dcfg.get("smtp") or {}
+    if smtp.get("host"):
+        # Built in: needs no mail program on the machine.
+        try:
+            port = int(smtp.get("port") or 587)
+            if smtp.get("ssl"):
+                server = smtplib.SMTP_SSL(smtp["host"], port, timeout=60,
+                                          context=ssl.create_default_context())
+            else:
+                server = smtplib.SMTP(smtp["host"], port, timeout=60)
+            with server:
+                if smtp.get("starttls", True) and not smtp.get("ssl"):
+                    server.starttls(context=ssl.create_default_context())
+                if smtp.get("user"):
+                    if not smtp.get("password_file"):
+                        return "digest.smtp.user is set but digest.smtp.password_file is not"
+                    server.login(smtp["user"], Path(smtp["password_file"]).read_text().strip())
+                server.send_message(msg)
+        except (OSError, smtplib.SMTPException) as exc:
+            return f"SMTP to {smtp['host']}: {exc}"
+        return None
+    try:
+        proc = subprocess.run(shlex.split(dcfg["send_command"]), input=msg.as_string(),
+                              text=True, capture_output=True)
+    except OSError as exc:
+        return f"{dcfg['send_command']}: {exc}"
+    if proc.returncode != 0:
+        return f"{dcfg['send_command']}: {(proc.stderr or proc.stdout).strip() or 'exit %d' % proc.returncode}"
+    return None
+
+
 def digest(cfg, to_stdout=False):
     state = State(cfg)
     with Lock(state, "digest") as got:
@@ -1142,17 +1494,11 @@ def digest(cfg, to_stdout=False):
         if to_stdout or not dcfg.get("to"):
             print(body)
             return 0
-        message = (
-            f"To: {dcfg['to']}\nFrom: {dcfg['from']}\n"
-            f"Subject: {dcfg['subject']} {now(cfg):%a %d %b}\n"
-            f"Date: {now(cfg):%a, %d %b %Y %H:%M:%S %z}\n"
-            "Content-Type: text/plain; charset=utf-8\n\n" + body
-        )
-        proc = subprocess.run(shlex.split(dcfg["send_command"]), input=message, text=True,
-                              capture_output=True)
-        if proc.returncode != 0:
-            state.problem("digest", None, f"send failed: {proc.stderr.strip()[:300]}")
+        error = send_mail(cfg, f"{dcfg['subject']} {now(cfg):%a %d %b}", body)
+        if error:
+            state.problem("digest", None, f"send failed: {error[:300]}")
             print(body)
+            print(f"workq: digest not sent: {error}", file=sys.stderr)
             return 1
         state.set_last_digest(stamp)
         log(f"digest sent to {dcfg['to']}")
@@ -1246,11 +1592,441 @@ def cmd_status(cfg):
         if state.limit_until() > time.time():
             print("usage limit until", dt.datetime.fromtimestamp(state.limit_until()).strftime("%H:%M"))
 
+# ---------------------------------------------------------------- schedule (no root)
+
+CRON_BEGIN = "# >>> workq schedule: written by `workq schedule on`; edits here are overwritten >>>"
+CRON_END = "# <<< workq schedule <<<"
+UNIT_MARK = "# Written by `workq schedule on`. Change config.yaml and run it again, don't edit."
+
+
+def run_quiet(cmd, timeout=30, env=None, text_in=None):
+    """Run a helper command. Returns (exit code, stdout, stderr); 127 if it can't start."""
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env,
+                              input=text_in)
+        return proc.returncode, proc.stdout, proc.stderr
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return 127, "", str(exc)
+
+
+def schedule_jobs(cfg):
+    """What to run and when: a list of (name, "HH:MM", [command, ...])."""
+    base = [str(Path(__file__).resolve()), "--config", cfg["_config_path"]]
+    jobs = [
+        ("night", cfg["window"]["start"], [base + ["night"]]),
+        ("digest", cfg["digest"]["at"], [base + ["digest"]]),
+    ]
+    for shift in cfg["extra_shifts"]:
+        commands = [base + ["night", "--until", shift["until"]]]
+        if shift["digest"]:
+            commands.append(base + ["digest"])
+        jobs.append(("shift-" + shift["start"].replace(":", ""), shift["start"], commands))
+    return jobs
+
+
+def unit_dir():
+    base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    return Path(base) / "systemd" / "user"
+
+
+def sd_quote(arg):
+    arg = arg.replace("%", "%%")
+    return '"%s"' % arg.replace("\\", "\\\\").replace('"', '\\"') if re.search(r"\s|\"|'", arg) else arg
+
+
+def systemd_units(cfg):
+    """File name -> contents for the user units."""
+    tz = f" {cfg['timezone']}" if cfg.get("timezone") else ""
+    units = {}
+    for name, start, commands in schedule_jobs(cfg):
+        lines = [UNIT_MARK, "[Unit]", f"Description=workq {name}", "", "[Service]", "Type=oneshot"]
+        for i, command in enumerate(commands):
+            # A leading "-" lets the next command run even if this one fails.
+            dash = "-" if i < len(commands) - 1 else ""
+            lines.append("ExecStart=" + dash + " ".join(sd_quote(a) for a in command))
+        lines += ["TimeoutStartSec=12h", "Nice=10", ""]
+        units[f"workq-{name}.service"] = "\n".join(lines)
+        units[f"workq-{name}.timer"] = "\n".join([
+            UNIT_MARK, "[Unit]", f"Description=Start workq {name}", "", "[Timer]",
+            f"OnCalendar=*-*-* {start}:00{tz}",
+            "# A machine that was off at the start time skips that run.",
+            "Persistent=false", "", "[Install]", "WantedBy=timers.target", "",
+        ])
+    return units
+
+
+def cron_block(cfg):
+    log_file = cfg["state_dir"] / "logs" / "cron.log"
+    lines = [CRON_BEGIN]
+    tz = cfg.get("timezone")
+    if tz and tz != system_timezone():
+        lines.append(f"CRON_TZ={tz}")
+    for _name, start, commands in schedule_jobs(cfg):
+        hour, minute = hhmm(start)
+        line = "; ".join(
+            " ".join(shlex.quote(a) for a in command) + f" >> {shlex.quote(str(log_file))} 2>&1"
+            for command in commands
+        )
+        lines.append(f"{minute} {hour} * * * {line}".replace("%", "\\%"))
+    lines.append(CRON_END)
+    return "\n".join(lines) + "\n"
+
+
+def system_timezone():
+    try:
+        return os.path.realpath("/etc/localtime").split("/zoneinfo/", 1)[1]
+    except IndexError:
+        return None
+
+
+def systemd_user_state():
+    """(usable, lingering, reason). User timers only fire unattended when lingering is on."""
+    if not shutil.which("systemctl"):
+        return False, False, "systemctl not found"
+    code, _out, err = run_quiet(["systemctl", "--user", "show-environment"])
+    if code != 0:
+        return False, False, "no systemd user session (" + (err.strip().splitlines() or ["no detail"])[0] + ")"
+    code, out, _err = run_quiet(["loginctl", "show-user", getpass.getuser(), "--property=Linger"])
+    return True, code == 0 and out.strip().endswith("=yes"), ""
+
+
+def crontab_read():
+    """(usable, current text, reason)."""
+    if not shutil.which("crontab"):
+        return False, "", "crontab not found"
+    code, out, err = run_quiet(["crontab", "-l"])
+    if code != 0 and "no crontab" not in err.lower():
+        return False, "", (err.strip().splitlines() or ["crontab -l failed"])[0]
+    return True, out if code == 0 else "", ""
+
+
+def strip_cron_block(text):
+    out, skipping = [], False
+    for line in text.splitlines():
+        if line.strip() == CRON_BEGIN:
+            skipping = True
+        elif line.strip() == CRON_END:
+            skipping = False
+        elif not skipping:
+            out.append(line)
+    return "\n".join(out).rstrip("\n") + ("\n" if out else "")
+
+
+def our_units():
+    folder = unit_dir()
+    if not folder.is_dir():
+        return []
+    return sorted(
+        f for f in folder.glob("workq-*.*")
+        if f.suffix in (".service", ".timer") and UNIT_MARK in f.read_text(errors="replace")
+    )
+
+
+def schedule_off():
+    """Remove both kinds of schedule. Returns what was removed."""
+    removed = []
+    units = our_units()
+    if units:
+        timers = [u.name for u in units if u.suffix == ".timer"]
+        if timers:
+            run_quiet(["systemctl", "--user", "disable", "--now", *timers])
+        for unit in units:
+            unit.unlink()
+        run_quiet(["systemctl", "--user", "daemon-reload"])
+        removed.append(f"{len(timers)} systemd user timer(s)")
+    usable, current, _why = crontab_read()
+    if usable and CRON_BEGIN in current:
+        run_quiet(["crontab", "-"], text_in=strip_cron_block(current))
+        removed.append("the workq lines in your crontab")
+    return removed
+
+
+def cmd_schedule(cfg, action, scheduler="auto"):
+    if not single_user(cfg):
+        raise WorkqError(
+            "`workq schedule` is for the no-root, single-user install. On a root install use: "
+            "sudo systemctl enable --now workq-night.timer workq-digest.timer"
+        )
+    jobs = schedule_jobs(cfg)
+    if action == "show":
+        tz = cfg.get("timezone") or "system time"
+        print(f"Planned ({tz}):")
+        for name, start, commands in jobs:
+            print(f"  {start}  {name}: " + "; then ".join(" ".join(c[3:]) for c in commands))
+        units = our_units()
+        usable, current, _why = crontab_read()
+        if units:
+            _ok, lingering, _why = systemd_user_state()
+            print(f"Installed: systemd user timers ({len(units) // 2}); lingering is "
+                  + ("on" if lingering else "OFF, so they only fire while you are logged in"))
+            code, out, _err = run_quiet(["systemctl", "--user", "list-timers", "--all", "workq-*"])
+            print(out.rstrip() if code == 0 else "  (systemctl --user list-timers failed)")
+        elif usable and CRON_BEGIN in current:
+            print("Installed: cron")
+            block = current.split(CRON_BEGIN, 1)[1].split(CRON_END, 1)[0].strip()
+            print("\n".join("  " + line for line in block.splitlines()))
+        else:
+            print("Installed: nothing. Run `workq schedule on`.")
+        return 0
+    if action == "off":
+        removed = schedule_off()
+        print("Removed " + " and ".join(removed) + "." if removed else "Nothing was scheduled.")
+        return 0
+
+    # on
+    sd_ok, lingering, sd_why = systemd_user_state()
+    if scheduler in ("auto", "systemd") and sd_ok and not lingering:
+        run_quiet(["loginctl", "enable-linger"])  # allowed on some systems; harmless to try
+        sd_ok, lingering, sd_why = systemd_user_state()
+    cron_ok, current, cron_why = crontab_read()
+    if scheduler == "auto":
+        scheduler = "systemd" if (sd_ok and lingering) else "cron" if cron_ok else None
+        if scheduler is None:
+            raise WorkqError(
+                "no way to schedule without root here: systemd user timers need lingering ("
+                + (sd_why or "lingering is off") + f"), and cron is unavailable ({cron_why}). "
+                f"Ask an admin for one of: `loginctl enable-linger {getpass.getuser()}`, or cron access."
+            )
+    # Check the chosen route works before removing whatever is scheduled now.
+    if scheduler == "systemd" and not sd_ok:
+        raise WorkqError(f"systemd user timers can't be used: {sd_why}")
+    if scheduler == "cron" and not cron_ok:
+        raise WorkqError(f"cron can't be used: {cron_why}")
+    schedule_off()
+    if scheduler == "systemd":
+        folder = unit_dir()
+        folder.mkdir(parents=True, exist_ok=True)
+        units = systemd_units(cfg)
+        for name, text in units.items():
+            (folder / name).write_text(text)
+        timers = [n for n in units if n.endswith(".timer")]
+        for command in (["daemon-reload"], ["enable", "--now", *timers]):
+            code, _out, err = run_quiet(["systemctl", "--user", *command])
+            if code != 0:
+                raise WorkqError(f"systemctl --user {' '.join(command)} failed: {err.strip()}")
+        print(f"Scheduled with systemd user timers: {', '.join(timers)}")
+        if not lingering:
+            print(f"WARNING: lingering is off, so these only fire while you are logged in. Ask an "
+                  f"admin to run `loginctl enable-linger {getpass.getuser()}`, or use "
+                  "`workq schedule on --scheduler cron`.")
+        print("See them: systemctl --user list-timers 'workq-*'   Logs: journalctl --user -u 'workq-*'")
+    else:
+        (cfg["state_dir"] / "logs").mkdir(parents=True, exist_ok=True)
+        _ok, current, _why = crontab_read()
+        base = strip_cron_block(current)
+        code, _out, err = run_quiet(["crontab", "-"], text_in=base + cron_block(cfg))
+        if code != 0:
+            raise WorkqError(f"crontab refused the new schedule: {err.strip()}")
+        print("Scheduled with cron. See it: crontab -l   Logs: " + str(cfg["state_dir"] / "logs" / "cron.log"))
+        if all(run_quiet(["pgrep", "-x", name])[0] != 0 for name in ("crond", "cron")):
+            print("WARNING: no cron service seems to be running on this machine, so nothing will fire. "
+                  "An admin can start it: systemctl enable --now crond")
+        if scheduler == "cron" and sd_ok and lingering:
+            print("(systemd user timers would also work here.)")
+        elif sd_ok and not lingering:
+            print(f"(Used cron because lingering is off. For systemd timers instead, an admin runs: "
+                  f"loginctl enable-linger {getpass.getuser()})")
+    for name, start, _commands in jobs:
+        print(f"  {start}  {name}")
+    return 0
+
+
+# ---------------------------------------------------------------- doctor
+
+
+def private(path):
+    """True if only the owner can read the file."""
+    return stat.S_IMODE(os.stat(path).st_mode) & 0o077 == 0
+
+
+def cmd_doctor(cfg, live=False):
+    """Check the setup and print one line per check. Exit code 1 if anything is broken."""
+    rows = []
+
+    def ok(text):
+        rows.append(("ok  ", text))
+
+    def warn(text):
+        rows.append(("WARN", text))
+
+    def bad(text):
+        rows.append(("FAIL", text))
+
+    solo = single_user(cfg)
+    v = sys.version_info
+    (ok if v >= (3, 9) else bad)(f"Python {v.major}.{v.minor}.{v.micro} (3.9 or later needed), {YAML_SOURCE}")
+
+    code, out, _err = run_quiet(["git", "--version"])
+    found = re.search(r"(\d+)\.(\d+)", out)
+    if code != 0 or not found:
+        bad("git not found. It needs an admin to install it: dnf install git")
+    elif (int(found.group(1)), int(found.group(2))) < (2, 28):
+        bad(f"{out.strip()} is too old; 2.28 or later needed")
+    else:
+        ok(out.strip())
+
+    ok(f"config {cfg['_config_path']}; "
+       + ("single-user mode" if solo else f"two-user mode, Claude runs as {cfg['claude']['agent_user']}"))
+    try:
+        cfg["state_dir"].mkdir(parents=True, exist_ok=True)
+        probe = cfg["state_dir"] / ".doctor"
+        probe.write_text("x")
+        probe.unlink()
+        ok(f"state folder {cfg['state_dir']} is writable")
+    except OSError as exc:
+        bad(f"state folder {cfg['state_dir']}: {exc}")
+
+    secrets = [("claude.env_file", cfg["claude"].get("env_file")),
+               ("git.ssh_key", cfg["git"].get("ssh_key")),
+               ("git.credential_file", cfg["git"].get("credential_file")),
+               ("digest.smtp.password_file", cfg["digest"]["smtp"].get("password_file"))]
+    for label, path in secrets:
+        if not path:
+            continue
+        if not os.path.isfile(path):
+            bad(f"{label}: {path} does not exist")
+        elif not private(path):
+            bad(f"{label}: {path} can be read by other users; run: chmod 600 {path}")
+        else:
+            ok(f"{label}: {path} is private")
+
+    # Claude Code
+    env = claude_env(cfg)
+    exe = claude_exe(cfg) if solo else None
+    mode = "off"
+    if not solo:
+        (ok if os.path.exists(cfg["claude"]["wrapper"]) else bad)(
+            f"wrapper {cfg['claude']['wrapper']} " + ("found" if os.path.exists(cfg["claude"]["wrapper"]) else "missing"))
+    elif not exe:
+        bad(f"Claude Code ({cfg['claude']['bin']}) not found. Install it without root: "
+            "curl -fsSL https://claude.ai/install.sh | bash")
+    else:
+        exe = str(Path(exe).resolve())
+        code, out, err = run_quiet([exe, "--version"], env=env)
+        (ok if code == 0 else bad)(f"Claude Code {out.strip() or err.strip()[:200]} at {exe}")
+        code, helptext, _err = run_quiet([exe, "--help"], env=env)
+        needed = ["--tools", "--allowedTools", "--permission-mode", "--max-budget-usd",
+                  "--no-session-persistence", "--append-system-prompt", "--settings"]
+        needed += ["--restricted"] if cfg["claude"].get("restricted") else []
+        needed += ["--strict-mcp-config"] if cfg["claude"].get("strict_mcp") else []
+        missing = [flag for flag in needed if flag not in helptext]
+        if missing:
+            bad("this Claude Code lacks " + ", ".join(missing) + "; update it (run: claude update)")
+        else:
+            ok("Claude Code has every option workq uses")
+        if any(env.get(name) for name in CREDENTIAL_VARS):
+            ok("a Claude credential is set")
+        else:
+            warn("no Claude credential found: put CLAUDE_CODE_OAUTH_TOKEN (from `claude setup-token`) "
+                 f"or ANTHROPIC_API_KEY in {cfg['claude'].get('env_file') or 'claude.env_file'}")
+        try:
+            settings_args(cfg)
+            if cfg["claude"].get("settings"):
+                ok(f"deny rules file {cfg['claude']['settings']} is valid")
+        except WorkqError as exc:
+            bad(str(exc))
+        # Sandbox
+        try:
+            mode = sandbox_mode(cfg)
+        except WorkqError as exc:
+            bad(str(exc))
+        if mode == "bwrap":
+            probe_dir = Path(tempfile.mkdtemp(prefix="doctor-", dir=str(cfg["state_dir"])))
+            (probe_dir / ".git").mkdir()
+            code, out, err = run_quiet(sandbox_wrap(cfg, probe_dir, [exe, "--version"]), env=env)
+            shutil.rmtree(probe_dir, ignore_errors=True)
+            if code == 0:
+                ok("sandbox: bubblewrap works, and Claude Code starts inside it")
+            else:
+                bad("sandbox: Claude Code does not start inside bubblewrap: "
+                    + (err.strip() or out.strip())[:300]
+                    + ". Add the folders it needs to claude.sandbox_binds, or set claude.sandbox: off")
+        elif cfg["bash_allow"]:
+            warn("no sandbox, and bash_allow lets agents run commands as you: they could read "
+                 "your keys and tokens. Empty bash_allow, or get bubblewrap installed")
+        else:
+            warn("no sandbox (bubblewrap missing or not permitted). Agents are held to their clone "
+                 "by Claude Code's own restricted mode only. An admin can add it: dnf install bubblewrap")
+
+    # Queue repo
+    repo = Repo(cfg, cfg["state_dir"])
+    code, out, err = run_quiet([*repo.base, "ls-remote", "--heads", cfg["repo_url"]], timeout=45, env=repo.env)
+    if code != 0:
+        bad(f"cannot reach the queue repo {cfg['repo_url']}: " + (" ".join(err.split()) or "no detail")[:300])
+    elif f"refs/heads/{cfg['branch']}" in out:
+        ok(f"queue repo reachable, branch {cfg['branch']} exists")
+    elif not out.strip():
+        warn("queue repo reachable but empty: run `workq init`")
+    else:
+        bad(f"queue repo reachable but has no branch {cfg['branch']}")
+
+    # Time zone, mail, schedule
+    if cfg.get("timezone"):
+        try:
+            now(cfg)
+            ok(f"time zone {cfg['timezone']}; the shift runs {cfg['window']['start']} to {cfg['window']['end']}")
+        except Exception as exc:  # zoneinfo raises several kinds
+            bad(f"time zone {cfg['timezone']}: {exc}")
+    else:
+        warn(f"no timezone in the config; using this machine's ({system_timezone() or 'unknown'})")
+    smtp = cfg["digest"]["smtp"]
+    if not cfg["digest"].get("to"):
+        warn("digest.to is empty: the digest is printed, not emailed")
+    elif smtp.get("host"):
+        ok(f"digest goes to {cfg['digest']['to']} through {smtp['host']}:{smtp.get('port')}")
+    else:
+        program = shlex.split(cfg["digest"]["send_command"])[0]
+        (ok if shutil.which(program) else bad)(
+            f"digest goes to {cfg['digest']['to']} with `{cfg['digest']['send_command']}`"
+            + ("" if shutil.which(program) else f", but {program} is not installed. Set digest.smtp.host instead"))
+    if solo:
+        usable, current, _why = crontab_read()
+        if our_units():
+            _sd, lingering, _why = systemd_user_state()
+            (ok if lingering else warn)("scheduled with systemd user timers"
+                                         + ("" if lingering else "; lingering is OFF, so they only fire while you are logged in"))
+        elif usable and CRON_BEGIN in current:
+            ok("scheduled with cron")
+        else:
+            warn("nothing is scheduled yet: run `workq schedule on`")
+
+    if live and solo and exe:
+        cmd = [exe, "-p", "--model", cfg["models"]["haiku"], "--output-format", "json",
+               "--permission-mode", "dontAsk", "--no-session-persistence", "--max-turns", "1"]
+        cmd += ["--restricted"] if cfg["claude"].get("restricted") else []
+        cmd += ["--strict-mcp-config"] if cfg["claude"].get("strict_mcp") else []
+        cmd += ["--tools", ""]
+        if mode == "bwrap":
+            probe_dir = Path(tempfile.mkdtemp(prefix="doctor-", dir=str(cfg["state_dir"])))
+            (probe_dir / ".git").mkdir()
+            cmd = sandbox_wrap(cfg, probe_dir, cmd)
+        code, out, err = run_quiet(cmd, timeout=180, env=env, text_in="Reply with the single word OK.")
+        if mode == "bwrap":
+            shutil.rmtree(probe_dir, ignore_errors=True)
+        try:
+            reply = json.loads(out.strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            reply = {}
+        if code == 0 and not reply.get("is_error") and reply.get("result"):
+            ok(f"live test: Claude answered ({str(reply['result']).strip()[:40]!r})")
+        else:
+            bad("live test failed: " + (str(reply.get("result") or "") or err.strip() or out.strip())[:300])
+
+    for level, text in rows:
+        print(f"[{level}] {text}")
+    fails = sum(1 for level, _ in rows if level == "FAIL")
+    warns = sum(1 for level, _ in rows if level == "WARN")
+    print(f"\n{fails} problem(s), {warns} warning(s).")
+    return 1 if fails else 0
+
+
 
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="workq", description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--config", default=os.environ.get("WORKQ_CONFIG", "/etc/workq/config.yaml"))
+    parser.add_argument("--config", default=default_config_path(),
+                        help="default: $WORKQ_CONFIG, then ~/.config/workq/config.yaml, "
+                             "then /etc/workq/config.yaml")
     parser.add_argument("--version", action="version", version=VERSION)
     sub = parser.add_subparsers(dest="cmd", required=True)
     sub.add_parser("init")
@@ -1267,11 +2043,23 @@ def main(argv=None):
     sub.add_parser("status")
     sub.add_parser("pause")
     sub.add_parser("resume")
+    p = sub.add_parser("doctor")
+    p.add_argument("--live", action="store_true",
+                   help="also make one tiny real call to Claude, to prove sign-in works")
+    p = sub.add_parser("schedule")
+    p.add_argument("action", choices=["show", "on", "off"])
+    p.add_argument("--scheduler", choices=["auto", "systemd", "cron"], default="auto")
     args = parser.parse_args(argv)
     signal.signal(signal.SIGPIPE, signal.SIG_DFL)  # quiet exit when piped into head
-    os.umask(0o002)
     try:
         cfg = load_config(args.config)
+        # Two users share the clones through a group; one user keeps everything private.
+        os.umask(0o077 if single_user(cfg) else 0o002)
+        apply_env(cfg)
+        if args.cmd == "doctor":
+            return cmd_doctor(cfg, args.live)
+        if args.cmd == "schedule":
+            return cmd_schedule(cfg, args.action, args.scheduler)
         if args.cmd == "init":
             cmd_init(cfg)
         elif args.cmd == "add":

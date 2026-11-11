@@ -1,0 +1,113 @@
+# workq configuration for a no-root, single-user install (install-user.sh).
+# Lives at ~/.config/workq/config.yaml. Keep it private: chmod 600.
+# Check your edits with: workq doctor
+
+# The queue repo.
+#   Azure DevOps over SSH:  git@ssh.dev.azure.com:v3/ORG/PROJECT/workq-queue
+#   GitHub over SSH:        git@github.com:YOU/workq-queue.git
+#   HTTPS with a token, for when outbound SSH (port 22) is blocked:
+#                           https://dev.azure.com/ORG/PROJECT/_git/workq-queue
+#                           and set git.credential_file below.
+repo_url: git@ssh.dev.azure.com:v3/ORG/PROJECT/workq-queue
+# Use "queue" if branch policy forces pull requests on main (create the branch first).
+branch: main
+
+# Where the runner keeps its clones, locks, ledger and problem log.
+state_dir: __STATE__
+
+# Base web address of the repo, for links in the digest.
+#   Azure DevOps:  https://dev.azure.com/ORG/PROJECT/_git/workq-queue?version=GBmain&path=
+#   GitHub:        https://github.com/YOU/workq-queue/tree/main
+web_url: https://dev.azure.com/ORG/PROJECT/_git/workq-queue?version=GBmain&path=
+
+# All times below are in this zone, whatever the machine's own clock is set to.
+timezone: Australia/Perth
+
+# The overnight shift. Put clock times in quotes.
+window:
+  start: "22:00"
+  end: "06:00"
+
+# More shifts in the day, each followed by its own digest. Example, a midday run:
+#   extra_shifts:
+#     - {start: "12:00", until: "15:00", digest: true}
+# Caps below are shared by every shift from one 22:00 to the next.
+extra_shifts: []
+
+max_attempts: 3        # per stage, per round of review
+max_output_mb: 20      # largest out/ folder an executor may produce
+allow_web: true        # false removes WebSearch/WebFetch from every stage
+limit_wait_min: 30     # wait after a usage limit when the reset time can't be read
+
+# Commands executors may run, e.g. ["python3 *"] for data work. Leave empty unless
+# `workq doctor` shows the sandbox working: without it, a command runs as you and
+# can read anything you can.
+bash_allow: []
+
+# Extra environment for git and Claude, e.g. a company proxy or certificate bundle:
+#   env:
+#     HTTPS_PROXY: http://proxy.example.com:8080
+#     NO_PROXY: localhost,127.0.0.1
+#     NODE_EXTRA_CA_CERTS: /etc/pki/tls/certs/ca-bundle.crt
+env: {}
+
+claude:
+  agent_user: null                 # null = single-user mode: Claude runs as you
+  bin: __CLAUDE__                  # the Claude Code program
+  env_file: __CONF__/claude.env    # holds the Claude token; given to Claude only
+  # Claude's own settings and state for these runs, kept apart from your personal ~/.claude.
+  config_dir: __STATE__/claude-home
+  settings: __CONF__/claude-settings.json   # deny rules: a second fence around your secrets
+  restricted: true                 # --restricted: file tools stay inside the clone, no code tools
+  strict_mcp: true                 # ignore any MCP servers set up on this account
+  # auto = use bubblewrap when it is installed and allowed; bwrap = refuse to run without it;
+  # off = never. Inside the sandbox Claude sees an empty home, /tmp and workq config.
+  sandbox: auto
+  sandbox_binds: []                # extra folders Claude Code needs to see (read-only), if any
+  pass_env: []                     # extra environment variable names to pass through to Claude
+  extra_args: []
+
+# Models behind each tier. Aliases follow the latest models; full model IDs pin them.
+models:
+  haiku: haiku
+  sonnet: sonnet
+  opus: opus
+
+# Limits per run. A plan may ask for less, never more.
+stages:
+  shape:       {tier: opus,   timeout_min: 15, max_turns: 30, budget_usd: 2.00}
+  exec-haiku:  {tier: haiku,  timeout_min: 20, max_turns: 30, budget_usd: 0.50}
+  exec-sonnet: {tier: sonnet, timeout_min: 45, max_turns: 60, budget_usd: 3.00}
+  exec-opus:   {tier: opus,   timeout_min: 60, max_turns: 80, budget_usd: 8.00}
+  check:       {tier: opus,   timeout_min: 20, max_turns: 30, budget_usd: 2.00}
+
+# Caps per tier from one 22:00 to the next. Shape and check count against opus.
+# On a subscription seat the dollar figure is Claude Code's estimate, so the run count is
+# the firmer limit. Start low: these runs share the seat's allowance with your own use.
+caps:
+  haiku:  {runs: 20, usd: 5}
+  sonnet: {runs: 10, usd: 15}
+  opus:   {runs: 8,  usd: 20}
+
+git:
+  author_name: workq
+  author_email: workq@example.com
+  ssh_key: __KEY__                 # used only for the queue repo; your own keys are left alone
+  # For HTTPS: a private file holding one line, https://anything:TOKEN@dev.azure.com
+  credential_file: null
+
+digest:
+  to: you@example.com
+  from: workq@example.com
+  subject: workq digest
+  at: "06:30"                      # when `workq schedule on` sends the morning digest
+  # Route 1, built in: send through an SMTP server. Needs no mail program installed.
+  smtp:
+    host: null                     # e.g. smtp.example.com; null = use send_command instead
+    port: 587
+    starttls: true                 # false for a plain internal relay on port 25
+    ssl: false                     # true for port 465
+    user: null                     # leave null for a relay that needs no sign-in
+    password_file: null            # a private file holding only the password
+  # Route 2: any command that reads a whole message on stdin.
+  send_command: /usr/sbin/sendmail -t

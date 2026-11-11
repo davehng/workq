@@ -1,5 +1,6 @@
-# workq configuration: one file per instance (home, work).
+# workq configuration for the root, two-user install (install.sh): one file per instance.
 # Lives at /etc/workq/config.yaml, readable by the workq user only.
+# (The no-root install uses etc/config.user.example.yaml instead.)
 
 # The queue repo, reached over SSH with the workq user's deploy key.
 repo_url: git@github.com:YOU/workq-queue.git
@@ -61,7 +62,17 @@ digest:
   to: you@example.com
   from: workq@example.com
   subject: workq digest
-  send_command: msmtp -t       # any command that reads a full message on stdin
+  # Route 1: any command that reads a full message on stdin.
+  send_command: msmtp -t
+  # Route 2, built in: set smtp.host and the command above is not used. Needs no mail
+  # program installed (msmtp is not in the RHEL repos).
+  smtp:
+    host: null                 # e.g. smtp.example.com
+    port: 587
+    starttls: true             # false for a plain internal relay on port 25
+    ssl: false                 # true for port 465
+    user: null                 # leave null for a relay that needs no sign-in
+    password_file: null        # a file only the workq user can read, holding the password
 
 git:
   author_name: workq

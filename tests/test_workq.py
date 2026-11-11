@@ -9,10 +9,13 @@ Sandbox tests are skipped where bubblewrap isn't available.
 import datetime as dt
 import importlib.machinery
 import importlib.util
+import fcntl
 import json
 import os
 import shutil
+import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -112,9 +115,33 @@ class Env:
             raise AssertionError(f"workq {args} failed:\n{proc.stdout}\n{proc.stderr}")
         return proc
 
-    def night(self, minutes=180):
+    def night(self, minutes=180, check=True):
         until = (dt.datetime.now() + dt.timedelta(minutes=minutes)).strftime("%H:%M")
-        return self.workq("night", "--until", until)
+        return self.workq("night", "--until", until, check=check)
+
+    def start(self, *args):
+        """Start workq in the background, for tests that kill it part-way."""
+        return subprocess.Popen([sys.executable, str(WORKQ), *args], env=self.env,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    def wait_for_call(self, count, timeout=30):
+        """Wait until the fake Claude has been started `count` times; return that call."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            calls = self.claude_calls()
+            if len(calls) >= count:
+                return calls[count - 1]
+            time.sleep(0.1)
+        raise AssertionError(f"fake Claude was not started {count} time(s)")
+
+    def set_config(self, **changes):
+        cfg = yaml.safe_load(self.config.read_text())
+        for key, value in changes.items():
+            if isinstance(value, dict) and isinstance(cfg.get(key), dict):
+                cfg[key].update(value)
+            else:
+                cfg[key] = value
+        self.config.write_text(yaml.safe_dump(cfg))
 
     def add(self, title, *directives):
         self.workq("add", title, "-m", "\n".join(directives))
@@ -139,7 +166,7 @@ class Env:
             if name.endswith(title_slug):
                 path = work / folder / name
                 meta_file = path / "meta.yaml"
-                meta = yaml.safe_load(meta_file.read_text()) if meta_file.exists() else {}
+                meta = yaml.safe_load(meta_file.read_text()) if meta_file.is_file() else {}
                 return folder, path, meta
         raise AssertionError(f"no item matching {title_slug}: {where}")
 
@@ -403,7 +430,7 @@ class WorkqTests(unittest.TestCase):
         try:
             e.add("First")
             e.add("Second")
-            e.night()
+            self.assertEqual(e.night(check=False).returncode, 1)   # a stopped shift is a failed one
             for slug in ("first", "second"):
                 folder, _, meta = e.item(slug)
                 self.assertEqual(folder, "inbox")
@@ -614,7 +641,7 @@ class SingleUserTests(unittest.TestCase):
     def test_missing_claude_gives_attempt_back_and_stops(self):
         e = self.make(claude={"bin": "/nonexistent/claude"})
         e.add("No claude")
-        e.night()
+        self.assertEqual(e.night(check=False).returncode, 1)
         folder, _, meta = e.item("no-claude")
         self.assertEqual(folder, "inbox")
         self.assertEqual(meta["shape_attempts"], 0)
@@ -643,6 +670,7 @@ class SingleUserTests(unittest.TestCase):
         self.assertEqual(probe["tmp_secret"], "hidden")
         self.assertEqual(probe["git_write"], "blocked")
         self.assertEqual(probe["etc_write"], "blocked")
+        self.assertEqual(probe["proc_leak"], "hidden")       # no way round through /proc
         self.assertEqual(probe["token"], "tok-123")          # Claude itself still gets its token
         self.assertFalse((e.home / "planted.txt").exists())  # writes to "home" went nowhere
         self.assertFalse(Path("/etc/workq-probe").exists())
@@ -660,6 +688,7 @@ class SingleUserTests(unittest.TestCase):
         self.assertEqual(probe["ssh_key"], "visible")
         self.assertEqual(probe["config"], "visible")
         self.assertEqual(probe["ledger"], "visible")
+        self.assertEqual(probe["proc_leak"], "visible")
 
     def test_required_sandbox_missing_claims_nothing(self):
         e = self.make(claude={"sandbox": "bwrap"})
@@ -678,7 +707,7 @@ class SingleUserTests(unittest.TestCase):
     def test_agent_cannot_plant_a_git_hook(self):
         e = self.make()
         e.add("Hooker", "fake-exec: githook")
-        e.night()
+        e.night(check=False)
         self.assertFalse((e.root / "hook-ran").exists())
         folder, _, _ = e.item("hooker")
         if os.geteuid() == 0:
@@ -691,7 +720,7 @@ class SingleUserTests(unittest.TestCase):
     def test_swapped_git_folder_is_caught_and_clone_discarded(self):
         e = self.make()
         e.add("Swapper", "fake-exec: gitswap")
-        e.night()
+        self.assertEqual(e.night(check=False).returncode, 1)
         self.assertTrue(any(".git folder" in p["problem"] for p in e.problems()))
         self.assertFalse((e.state / "clones" / "exec-sonnet").exists())
         self.assertFalse(Path("/tmp/pwned").exists())
@@ -915,6 +944,346 @@ class SingleUserTests(unittest.TestCase):
         e.add("Bundled", "fake-tier: haiku")
         e.night()
         self.assertEqual(e.item("bundled")[0], "review")
+
+
+def alive(pid):
+    """True if the process exists and is not a finished one waiting to be collected."""
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z"
+    except (OSError, IndexError):
+        return False
+
+
+def gone_within(pid, seconds):
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        if not alive(pid):
+            return True
+        time.sleep(0.1)
+    return False
+
+
+class FixesIn021Tests(unittest.TestCase):
+    """One test or more for each fault found in the 0.2.0 review."""
+
+    SLOW = {"exec-sonnet": {"tier": "sonnet", "timeout_min": 1, "max_turns": 10, "budget_usd": 1}}
+
+    def setUp(self):
+        self.envs = []
+
+    def tearDown(self):
+        for e in self.envs:
+            e.cleanup()
+
+    def make(self, **overrides):
+        e = Env(**overrides)
+        self.envs.append(e)
+        return e
+
+    # ---- 1. a runner stopped part-way through a run
+
+    def slow_item(self, e):
+        e.add("Slow", "fake-exec: timeout")     # the fake sleeps 30 seconds
+        e.workq("run", "shape")
+        return e.state / "clones" / "exec-sonnet" / ".git"
+
+    def unslow(self, e):
+        _, path, _ = e.item("slow")
+        e.push_file(f"ready/sonnet/{path.name}/brief.md", "# Slow\n\nNow quick.\n")
+
+    def test_sigterm_stops_the_agent_unlocks_the_clone_and_the_stage_still_works(self):
+        e = self.make(stages=self.SLOW)
+        git = self.slow_item(e)
+        runner = e.start("run", "exec-sonnet")
+        agent = e.wait_for_call(2)["pid"]
+        self.assertFalse(os.stat(git).st_mode & 0o222)      # locked while the agent works
+        runner.send_signal(signal.SIGTERM)
+        runner.communicate(timeout=40)
+        self.assertEqual(runner.returncode, 143)
+        self.assertTrue(gone_within(agent, 5), "the agent outlived the runner")
+        self.assertTrue(os.stat(git).st_mode & 0o200)       # unlocked on the way out
+        self.unslow(e)
+        self.assertEqual(e.workq("run", "exec-sonnet").returncode, 0)
+        folder, _, meta = e.item("slow")
+        self.assertEqual(folder, "check")
+        self.assertEqual(meta["unfinished"], 1)
+        self.assertFalse(any("Permission denied" in p["problem"] for p in e.problems()))
+
+    def test_sigkill_leaves_a_locked_clone_that_the_next_run_repairs(self):
+        e = self.make(stages=self.SLOW)
+        git = self.slow_item(e)
+        runner = e.start("run", "exec-sonnet")
+        agent = e.wait_for_call(2)["pid"]
+        runner.kill()                                       # no chance to clean up
+        runner.communicate(timeout=20)
+        self.assertFalse(os.stat(git).st_mode & 0o222)      # still locked: this is what 0.2.0 tripped on
+        self.assertTrue(gone_within(agent, 5), "the agent outlived a killed runner")
+        self.unslow(e)
+        self.assertEqual(e.workq("run", "exec-sonnet").returncode, 0)
+        self.assertEqual(e.item("slow")[0], "check")
+        self.assertEqual(e.problems(), [])
+
+    def test_item_whose_runs_never_finish_is_blocked_after_three(self):
+        e = self.make(stages=self.SLOW)
+        self.slow_item(e)
+        for n in (2, 3, 4):
+            runner = e.start("run", "exec-sonnet")
+            e.wait_for_call(n)
+            runner.kill()
+            runner.communicate(timeout=20)
+        e.workq("run", "exec-sonnet")
+        folder, _, meta = e.item("slow")
+        self.assertEqual(folder, "blocked")
+        self.assertIn("3 runs ended without finishing", meta["blocked_reason"])
+        self.assertEqual(len(e.claude_calls()), 4)          # the fourth run was not started
+
+    # ---- 2. two-user mode: the agent user and the runner's state
+
+    def two_user(self, **overrides):
+        """Two-user mode with stand-ins: `sudo` and the wrapper run the fake as this user."""
+        e = self.make(**overrides)
+        wrapper = e.root / "wrapper.sh"
+        wrapper.write_text(f"#!/bin/sh\numask 002\nexec {FAKE} \"$@\"\n")
+        wrapper.chmod(0o755)
+        e.tool("sudo", "shift 4\nexec \"$@\"\n")          # drops: -n -H -u USER
+        e.set_config(claude={"agent_user": "someone-else", "wrapper": str(wrapper)})
+        return e
+
+    def test_two_user_mode_opens_only_the_working_clone_to_the_agent(self):
+        e = self.two_user()
+        e.add("Perms", "fake-exec: perms")
+        e.night()
+        folder, path, _ = e.item("perms")
+        self.assertEqual(folder, "review")
+        seen = dict(line.split("=") for line in (path / "out" / "perms.txt").read_text().split())
+        self.assertEqual(seen["state"], "0o710")            # may pass through, not list or write
+        self.assertEqual(seen["clones"], "0o710")
+        self.assertEqual(seen["ledger"], "0o600")
+        self.assertEqual(seen["other_clone"], "0o700")      # every other clone is shut
+        self.assertEqual(seen["clone"], "0o2770")           # its own clone is open for the run
+        self.assertEqual(seen["itemdir"], "0o2770")
+        self.assertEqual(seen["brief"], "0o660")
+        self.assertEqual(seen["git"], "0o550")              # readable, never writable
+        self.assertEqual(int(seen["gitconfig"], 8) & 0o222, 0)
+        self.assertEqual(seen["umask"], "0o2")
+        # At rest every clone is shut again, and nothing in the state folder is group-writable.
+        for clone in (e.state / "clones").iterdir():
+            self.assertEqual(stat.S_IMODE(clone.stat().st_mode), 0o700, clone.name)
+        for entry in e.state.iterdir():
+            self.assertEqual(stat.S_IMODE(entry.stat().st_mode) & 0o027, 0, entry.name)
+        self.assertNotIn("sharedrepository", (e.state / "clones" / "shape" / ".git" / "config").read_text().lower())
+
+    def test_state_left_group_writable_by_an_older_version_is_tightened(self):
+        e = self.two_user()
+        e.add("Old state")
+        e.workq("run", "shape")
+        # Put things back the way 0.1 and 0.2.0 left them.
+        clone = e.state / "clones" / "shape"
+        os.chmod(e.state, 0o2770)
+        os.chmod(e.state / "ledger.jsonl", 0o664)
+        os.chmod(clone, 0o2775)
+        os.chmod(clone / ".git", 0o2775)
+        os.chmod(clone / ".git" / "config", 0o664)
+        subprocess.run(["git", "config", "core.sharedRepository", "group"], cwd=clone, check=True)
+        e.add("Second")
+        e.workq("run", "shape")
+        self.assertEqual(stat.S_IMODE(e.state.stat().st_mode), 0o710)
+        self.assertEqual(stat.S_IMODE((e.state / "ledger.jsonl").stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(clone.stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE((clone / ".git" / "config").stat().st_mode) & 0o022, 0)
+        self.assertNotIn("sharedrepository", (clone / ".git" / "config").read_text().lower())
+
+    # ---- 3. replan loop
+
+    def test_executor_that_always_asks_for_a_new_plan_is_blocked(self):
+        e = self.make()
+        e.add("Loop", "fake-exec: replan-always")
+        e.night()
+        folder, _, meta = e.item("loop")
+        self.assertEqual(folder, "blocked")
+        self.assertEqual(meta["shape_attempts"], 3)
+        self.assertIn("asked for a new plan after 3 plans", meta["blocked_reason"])
+        self.assertEqual(len(e.claude_calls()), 6)          # three plans, three tries, then stop
+
+    # ---- 4. symbolic links
+
+    def test_links_made_by_an_agent_are_removed_and_never_written_through(self):
+        e = self.make()
+        e.add("Linker", "fake-exec: symlink")
+        e.night()
+        folder, path, meta = e.item("linker")
+        self.assertEqual(folder, "blocked")
+        self.assertIn("does not own", meta["blocked_reason"])
+        self.assertEqual(list((e.root / "outside").iterdir()), [])     # nothing landed outside the repo
+        work = e.clone()
+        links = [p for p in work.rglob("*") if p.is_symlink() and ".git" not in p.parts]
+        self.assertEqual(links, [])
+        self.assertTrue((path / "log").is_dir())                       # the real log folder is back
+        self.assertEqual(len(list((path / "log").glob("*-exec-sonnet*.json"))), 3)
+
+    def test_link_pushed_into_the_repo_is_deleted_not_followed(self):
+        e = self.make()
+        victim = e.root / "victim.txt"
+        victim.write_text("ORIGINAL\n")
+        work = e.clone()
+        item = work / "inbox" / "2026-11-10-linked"
+        item.mkdir(parents=True)
+        (item / "brief.md").write_text("# Linked\n\nfake-tier: haiku\n")
+        os.symlink(victim, item / "meta.yaml")       # the runner writes meta.yaml: aim it elsewhere
+        os.symlink(victim, work / "inbox" / "loose.md")
+        for cmd in (["add", "-A"], ["-c", "user.name=x", "-c", "user.email=x@x", "commit", "-qm", "links"],
+                    ["push", "-q", "origin", "HEAD"]):
+            subprocess.run(["git", *cmd], cwd=work, check=True)
+        e.night()
+        self.assertEqual(victim.read_text(), "ORIGINAL\n")
+        folder, path, meta = e.item("linked")
+        self.assertEqual(folder, "review")
+        self.assertFalse((path / "meta.yaml").is_symlink())
+        self.assertEqual(meta["tier"], "haiku")
+        self.assertTrue(any("removed symbolic links" in p["problem"] for p in e.problems()))
+        modes = subprocess.run(["git", "ls-tree", "-r", "HEAD"], cwd=path.parents[1],
+                               capture_output=True, text=True).stdout
+        self.assertNotIn("120000", modes)             # git's mode for a symbolic link
+
+    # ---- 5. mail password
+
+    def test_mail_password_is_not_sent_unencrypted(self):
+        e = self.make(digest={"to": "me@example.test", "from": "w@example.test",
+                              "smtp": {"host": "smtp.example.test", "port": 25, "starttls": False,
+                                       "user": "me", "password_file": "/dev/null"}})
+        proc = e.workq("digest", check=False)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("refusing to send the mail password unencrypted", proc.stderr)
+
+    # ---- smaller faults
+
+    def test_helper_commands_wait_for_their_lock_then_give_up(self):
+        e = self.make(lock_wait_s=1)
+        holder = open(e.state / "locks" / "tools.lock", "w")
+        self.addCleanup(holder.close)
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        started = time.time()
+        proc = e.workq("add", "While locked", check=False)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("another workq command is still running", proc.stderr)
+        self.assertGreater(time.time() - started, 0.9)
+        e.set_config(lock_wait_s=20)
+        threading.Timer(1.0, holder.close).start()          # closing the file lets go of the lock
+        e.workq("add", "After the lock")
+        self.assertEqual(e.item("after-the-lock")[0], "inbox")
+        self.assertRaises(AssertionError, e.item, "while-locked")
+
+    def test_blank_and_numeric_env_values_in_the_config(self):
+        e = self.make(env={"NO_PROXY": None, "EMPTY": "", "RETRIES": 3, "HTTPS_PROXY": "http://proxy.example.test:1"})
+        e.add("Env values")
+        e.workq("run", "shape")
+        seen = e.claude_calls()[0]["env"]
+        self.assertEqual(seen["RETRIES"], "3")
+        self.assertEqual(seen["HTTPS_PROXY"], "http://proxy.example.test:1")
+        self.assertNotIn("EMPTY", seen)
+
+    def test_claude_runs_in_the_config_time_zone(self):
+        e = self.make(timezone="Asia/Tokyo")
+        e.add("Zone")
+        e.workq("run", "shape")
+        self.assertEqual(e.claude_calls()[0]["env"]["TZ"], "Asia/Tokyo")
+
+    def test_unexpected_error_sets_one_item_aside_and_the_shift_goes_on(self):
+        e = self.make()
+        e.push_file("inbox/2026-01-01-poison/brief.md", "# Poison\n")
+        e.push_file("inbox/2026-01-01-poison/meta.yaml/keep", "meta.yaml is a folder here\n")
+        e.add("Healthy", "fake-tier: haiku")
+        proc = e.night()
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(e.item("healthy")[0], "review")
+        self.assertEqual(e.item("poison")[0], "inbox")
+        hits = [p for p in e.problems() if "unexpected error, item set aside" in p["problem"]]
+        self.assertEqual(len(hits), 1)                      # reported once, not once per pass
+
+    def test_yaml_aliases_and_broken_meta_are_harmless(self):
+        e = self.make()
+        e.add("Bomb", "fake-shape: alias")
+        started = time.time()
+        e.workq("run", "shape")
+        self.assertLess(time.time() - started, 20)
+        folder, _, _ = e.item("bomb")
+        self.assertEqual(folder, "inbox")
+        self.assertTrue(any("no valid tier" in p["problem"] for p in e.problems()))
+        runner = load_runner()
+        self.assertEqual(runner.front_matter("---\na: &x [1]\ntier: *x\n---\nbody")[0], {})
+        broken = e.root / "item"
+        broken.mkdir()
+        (broken / "meta.yaml").write_text("history: nope\nshape_attempts: lots\nruns: -4\ncost_usd: [1]\n")
+        meta = runner.load_meta(broken)
+        self.assertEqual((meta["history"], meta["shape_attempts"], meta["runs"], meta["cost_usd"]), ([], 0, 0, 0.0))
+        (broken / "meta.yaml").write_text("[not, a, mapping\n")
+        self.assertEqual(runner.load_meta(broken)["execute_attempts"], 0)
+
+    def test_run_that_ends_in_an_error_is_not_used_and_says_why(self):
+        e = self.make()
+        e.add("Out of turns", "fake-shape: error-after-plan")
+        e.workq("run", "shape")
+        folder, path, meta = e.item("out-of-turns")
+        self.assertEqual(folder, "inbox")                   # 0.2.0 sent this on with a half-written plan
+        self.assertFalse((path / "plan.md").exists())
+        self.assertEqual(meta["shape_attempts"], 1)
+        self.assertTrue(any("Reached maximum number of turns" in p["problem"] for p in e.problems()))
+
+    def test_oversized_text_file_is_refused(self):
+        e = self.make(max_text_mb=0.002)
+        e.add("Big plan", "fake-shape: bigplan")
+        e.workq("run", "shape")
+        self.assertEqual(e.item("big-plan")[0], "inbox")
+        self.assertTrue(any("plan.md is over 0.002 MB" in p["problem"] for p in e.problems()))
+
+    def test_token_in_the_repo_url_is_never_printed(self):
+        e = self.make()
+        e.tool("crontab", "exit 1\n")
+        e.tool("systemctl", "exit 1\n")
+        e.tool("loginctl", "exit 1\n")
+        e.env["NO_PROXY"] = e.env["no_proxy"] = "127.0.0.1"
+        e.set_config(repo_url="https://buildbot:s3cret-t0ken@127.0.0.1:9/q.git")
+        doctor = e.workq("doctor", check=False)
+        self.assertIn("repo_url has a password or token in it", doctor.stdout)
+        run = e.workq("run", "shape", check=False)
+        status = e.workq("status", check=False)
+        everything = doctor.stdout + doctor.stderr + run.stdout + run.stderr + status.stdout + status.stderr
+        everything += (e.state / "problems.jsonl").read_text()
+        self.assertNotIn("s3cret-t0ken", everything)
+        self.assertIn("https://***@127.0.0.1:9/q.git", everything)
+        runner = load_runner()
+        self.assertEqual(runner.redact("see https://tok@host/x and git@github.com:me/q.git"),
+                         "see https://***@host/x and git@github.com:me/q.git")
+
+    def test_crontab_block_without_its_end_marker_keeps_your_lines(self):
+        runner = load_runner()
+        ours = "0 22 * * * /home/me/.local/share/workq/bin/workq --config /home/me/.config/workq/config.yaml night >> /x 2>&1"
+        text = "\n".join(["1 1 * * * mine-above", runner.CRON_BEGIN, "CRON_TZ=Australia/Perth", ours,
+                          "2 2 * * * mine-below", ""])
+        self.assertEqual(runner.strip_cron_block(text), "1 1 * * * mine-above\n2 2 * * * mine-below\n")
+        whole = "\n".join(["1 1 * * * mine", runner.CRON_BEGIN, ours, runner.CRON_END, "3 3 * * * later", ""])
+        self.assertEqual(runner.strip_cron_block(whole), "1 1 * * * mine\n3 3 * * * later\n")
+
+    def test_odd_reset_times_fall_back_to_the_default_wait(self):
+        runner = load_runner()
+        e = self.make()
+        cfg = runner.load_config(e.config)
+        for text in ("limit reached, resets 5:75", "resets 31", "limit reached"):
+            wait = runner.parse_reset(text, cfg) - time.time()
+            self.assertAlmostEqual(wait, float(cfg["limit_wait_min"]) * 60, delta=5, msg=text)
+        self.assertEqual(runner.parse_reset("usage limit reached|1900000000", cfg), 1900000000.0)
+
+    def test_changed_git_ref_is_caught(self):
+        e = self.make()
+        e.add("Ref writer", "fake-exec: githead")
+        proc = e.night(check=False)
+        folder, _, _ = e.item("ref-writer")
+        if os.geteuid() == 0:       # root ignores the read-only lock, so the change lands and is caught
+            self.assertEqual(proc.returncode, 1)
+            self.assertEqual(folder, "ready/sonnet")
+            self.assertTrue(any(".git folder" in p["problem"] for p in e.problems()))
+        else:                       # anyone else is stopped by the lock
+            self.assertEqual(folder, "review")
 
 
 if __name__ == "__main__":

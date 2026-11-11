@@ -1,4 +1,4 @@
-# workq 0.2
+# workq 0.2.1
 
 A git repo holds a queue of knowledge-work briefs. Each night a runner script on a Linux
 machine has Claude shape each brief into a plan, carry it out on the cheapest model that
@@ -14,11 +14,41 @@ Design doc: https://claude.ai/artifact/UErMHjrscWhxJkd1ekApyA
 | Built for | RHEL 9 at work, or any Linux where you have no root | A VM you control (the home setup) |
 | Needs root | No. Everything lives in your home folder | Yes, once, to install |
 | Who runs Claude | You, the same user that runs the queue | A second user, `workq-agent`, through sudo |
-| What keeps agents from your keys | A bubblewrap sandbox when the machine has one, plus Claude Code's restricted mode and deny rules | Linux file permissions between the two users, plus restricted mode |
+| What keeps agents from your keys | A bubblewrap sandbox when the machine has one, plus Claude Code's restricted mode and deny rules | Linux file permissions between the two users (the agent user can reach only the clone it is working in, and only during its run), plus restricted mode |
 | Schedule | `workq schedule on`: systemd user timers, or cron | systemd system timers |
 | Config | `~/.config/workq/config.yaml` | `/etc/workq/config.yaml` |
 
 The runner, prompts and queue repo are the same in both.
+
+## What changed in 0.2.1
+
+Fixes from a review of 0.2.0. Upgrade any 0.2.0 install; the first fix matters most.
+
+- **A runner stopped part-way no longer breaks its stage.** In 0.2.0, stopping the runner
+  while an agent worked (`systemctl stop`, a timeout, a reboot) left that stage's clone
+  read-only, and every later run of the stage failed. Now the agent is stopped with the
+  runner, the clone is unlocked on the way out, and every run repairs a clone left locked.
+- **Two-user mode: the agent user can no longer write the runner's files.** The state
+  folder was group-writable, so an agent able to run commands could have run programs as
+  the runner user. Now the ledger, locks and other clones are private to the runner. The
+  one clone an agent works in is opened to it for the length of that run and shut after.
+- **Replans are counted.** An executor that keeps asking for a new plan is blocked after
+  three plans, instead of looping every night.
+- **Symbolic links are not allowed in the queue.** The runner deletes any it finds, never
+  reads or writes through one, and fails a run that creates one.
+- **The mail password is never sent unencrypted.** With `starttls` and `ssl` both off, a
+  sign-in is refused unless the server is on the same machine.
+- **A run that ends in an error is not used**, even if it left its output file, and the
+  digest says why (for example "Reached maximum number of turns").
+- **An item whose runs keep dying is blocked** after three ("runs ended without finishing").
+- **One bad item can't stop a shift.** An unexpected error sets that item aside until the
+  next shift and is reported in the digest. `workq night` exits 1 if Claude could not run.
+- **The sandbox has its own process list**, so nothing outside it can be reached through `/proc`.
+- Smaller: helper commands wait their turn for the shared clone; blank values under `env:`
+  are fine; YAML aliases in agent-written files are refused; `plan.md`, `result.md` and
+  `check.md` have a size cap (`max_text_mb`); a token in `repo_url` is never printed and
+  `doctor` flags it; `schedule off` keeps your crontab lines if its end marker is missing;
+  the `.git` check covers `HEAD`, the index and every ref; Claude runs in the config's time zone.
 
 ## What changed in 0.2
 
@@ -145,7 +175,8 @@ Caps are counted from one 22:00 to the next, so every shift in that day shares t
 
 Set `digest.smtp.host` and the digest is sent by the runner itself; no mail program is
 needed. For a server that needs sign-in, set `user` and put the password alone in a
-private file named by `password_file`. Otherwise `digest.send_command` is used
+private file named by `password_file`. A sign-in is only made over an encrypted
+connection (`starttls` or `ssl`). Otherwise `digest.send_command` is used
 (`/usr/sbin/sendmail -t` by default on this install). Microsoft 365 is turning off
 password sign-in for SMTP, so at work ask IT which route to use: an internal relay that
 needs no sign-in is the simplest fit for `smtp.host`.
@@ -157,7 +188,8 @@ These do, in order of strength:
 
 1. **Sandbox**, when bubblewrap is installed and allowed (`claude.sandbox: auto`). Each run
    sees the whole system read-only, and an empty home folder, `/tmp` and workq config. Only
-   the clone it is working in is writable, and that clone's `.git` is read-only.
+   the clone it is working in is writable, and that clone's `.git` is read-only. It has its
+   own process list, so it can't see or reach anything running outside.
    `workq doctor` says whether it is working. Set `sandbox: bwrap` to refuse to run without it.
 2. **Restricted mode** (`--restricted`), always on: Claude's file tools can't leave the
    clone, and tools that run commands are removed unless `bash_allow` grants one.
@@ -221,8 +253,9 @@ For a VM you control. Ubuntu, Debian, or RHEL 9 and its rebuilds.
 10. **Turn on the timers.**
     `sudo systemctl enable --now workq-night.timer workq-digest.timer`
 
-**Upgrading a 0.1 install:** unzip 0.2 and run `sudo ./install.sh` again. Config,
-credentials, keys and timers are kept, and nothing in the queue repo changes.
+**Upgrading a 0.1 or 0.2.0 install:** unzip this version and run `sudo ./install.sh`
+again. Config, credentials, keys and timers are kept, and nothing in the queue repo
+changes. The first run tightens the permissions on `/var/lib/workq`.
 
 ## Try it on your own machine first (about 10 minutes)
 
@@ -315,12 +348,23 @@ The config is found at `$WORKQ_CONFIG`, then `~/.config/workq/config.yaml`, then
   and `out/`, or check) is thrown away and the run counts as failed.
 - **`.git`**: read-only while an agent runs. If it has changed afterwards, the clone is
   thrown away, the shift stops and the digest says so.
+- **Symbolic links**: deleted wherever they appear in the queue repo. A run that makes
+  one fails.
+- **Runs that end in an error** (turn limit, budget, API fault) count as failed attempts,
+  whatever files they left.
+- **Replans**: an executor may send an item back for a new plan until it has had three
+  plans; then the item is blocked.
+- **Runs that never finish**: if the runner is killed or the machine goes down mid-run,
+  the agent is stopped too and the next run of that stage repairs the clone. An item this
+  happens to three times is blocked.
+- **Unexpected errors**: the item is set aside until the next shift and the digest reports
+  it. The rest of the shift goes on.
 - **Caps**: runs and estimated dollars per tier, from one 22:00 to the next. Shape and
   check count as opus.
 - **Usage limits**: the attempt is given back and the shift sleeps until the limit resets,
   if that is before the shift ends.
 - **Broken setup** (Claude won't start, or can't sign in): the attempt is given back and
-  the shift stops, so a bad token doesn't push every item into `blocked/`.
+  the shift stops with exit code 1, so a bad token doesn't push every item into `blocked/`.
 - **Logs**: each item's `log/` holds the raw output of every run. In the state folder,
   `ledger.jsonl` has one line per run and `problems.jsonl` feeds the digest's Problems section.
 
@@ -344,31 +388,47 @@ Run `workq doctor` first. Common cases on a locked-down machine:
 
 Tested:
 
-- 47 end-to-end tests with a fake `claude` against a local git repo. They pass on Python
-  3.13 with system PyYAML, on Python 3.9 with the bundled PyYAML, and run as an
-  unprivileged user. They cover everything in 0.1 plus: the stripped environment, the
-  sandbox (home, `/tmp`, config and state hidden; `.git` and the system read-only), `.git`
-  locking and swap detection, hooks never run, the token file for HTTPS, built-in SMTP
-  against a local test server, send failures, cron and systemd scheduling against stand-in
-  `crontab` and `systemctl`, the cron line in a bare cron environment, unquoted clock
-  times, and `doctor`.
-- `install-user.sh` as a fresh user with no sudo rights, on Python 3.9 with no PyYAML:
-  install, `doctor`, a full shift with the sandbox on, `schedule on` (cron), `schedule off`
-  and uninstall.
+- 67 end-to-end tests with a fake `claude` against a local git repo. They pass on Python
+  3.13 with system PyYAML and on Python 3.9 with the bundled PyYAML, as root and as an
+  unprivileged user. They cover the queue stages, the guard, caps, usage limits, the
+  stripped environment, the sandbox (home, `/tmp`, config and state hidden; `.git` and the
+  system read-only), `.git` locking and swap detection, hooks never run, the token file for
+  HTTPS, built-in SMTP against a local test server, cron and systemd scheduling against
+  stand-in `crontab` and `systemctl`, and `doctor`.
+- New in 0.2.1, 20 of those tests cover the fixes: the runner stopped with TERM and with
+  KILL in the middle of a run, an item whose runs never finish, two-user folder modes
+  (with a stand-in `sudo`), tightening a state folder left by an older version, the replan
+  loop, links made by an agent and links pushed to the repo, the mail password refusal,
+  the lock on `init`, `add`, `pause` and `status`, blank and numeric `env:` values, the
+  time zone handed to Claude, an unexpected error in one item, YAML aliases and a broken
+  `meta.yaml`, a run that ends in an error after writing its file, the size cap, tokens in
+  `repo_url`, a crontab block with its end marker missing, bad reset times, and a changed
+  git ref.
+- `install.sh` on Ubuntu 24.04 with the real `workq` and `workq-agent` users: three briefs
+  through a shift; the agent user tried to list the state folder, write the ledger, make
+  files, edit git config in its own and another clone, and read a clone at rest, and each
+  was refused; a state folder with the old open modes was tightened on the next run; the
+  runner was stopped mid-run and the agent went with it.
+- `install-user.sh` from a fresh unzip as a new user with no sudo rights, on Python 3.9
+  with no PyYAML: install, `doctor`, a full shift with the sandbox on, `schedule on`
+  (cron), `schedule off` and uninstall.
 - One real brief through every stage with real models (Opus, Sonnet, Opus) in single-user
-  mode, inside the sandbox, with restricted mode and the deny rules.
-- `install.sh` on Ubuntu 24.04 and a shift in two-user mode, including an agent trying to
-  plant a git hook and to swap `.git`.
+  mode with `sandbox: bwrap`, restricted mode and the deny rules. The runner was stopped
+  while real Claude was planning: Claude stopped with it, `.git` was unlocked, and the next
+  shift picked the brief up and finished it.
 - The generated systemd user units pass `systemd-analyze verify`.
 
 Not tested:
 
 - **RHEL 9 itself.** No RHEL image could be fetched in the build environment. Python 3.9
-  was tested; RHEL's own git, cron (`CRON_TZ`), bubblewrap 0.4 and SELinux were not.
+  was tested; RHEL's own git, cron (`CRON_TZ`) and SELinux were not. The sandbox was
+  tested with bubblewrap 0.9, not RHEL 9's 0.6. Every flag workq passes exists in 0.6, but
+  run `workq doctor` on the RHEL box before you trust it.
 - systemd user timers firing, and lingering, under a real login session.
 - The `dnf` path of `install.sh`.
 - GitHub or Azure DevOps over SSH or HTTPS (tests used a local repo; the token file was
   tested with git's own credential lookup).
 - SMTP with TLS or sign-in, and Microsoft 365.
-- Real models as an unprivileged user inside the sandbox (the real run was as root).
+- Real models as an unprivileged user inside the sandbox (the real run was as root; the
+  unprivileged runs used the fake `claude`).
 - A real usage limit (the wording Claude Code uses was simulated).

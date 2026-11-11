@@ -6,8 +6,10 @@ the item's brief.md tells it, through lines such as:
 
     fake-tier: haiku            tier the shaper picks (default sonnet)
     fake-shape: plan | questions | nothing | escape | touch-meta | stray | badtier
+                | bigplan | alias | error-after-plan
     fake-exec: result | replan-once | nothing | timeout | limit-once | bigout | escape
-               | race | probe | probe-read | githook | gitswap
+               | race | probe | probe-read | githook | gitswap | githead
+               | replan-always | symlink | perms
     fake-check: pass | fail,pass | fail,fail,fail ...   (one per check attempt)
 
 Every call's arguments are appended to $FAKE_CLAUDE_LOG as one JSON line.
@@ -15,6 +17,8 @@ Every call's arguments are appended to $FAKE_CLAUDE_LOG as one JSON line.
 import json
 import os
 import re
+import shutil
+import stat
 import sys
 import time
 from pathlib import Path
@@ -53,7 +57,7 @@ if log_path:
         with open(log_path, "a") as fh:
             fh.write(json.dumps({"stage": stage, "item": item.name, "argv": argv,
                                  "cwd": str(Path.cwd()), "prompt": prompt,
-                                 "env": dict(os.environ)}) + "\n")
+                                 "pid": os.getpid(), "env": dict(os.environ)}) + "\n")
     except OSError:
         pass  # inside a sandbox the log's folder is hidden
 
@@ -98,11 +102,24 @@ if stage == "shape":
         (item / "scratch.md").write_text("thinking\n")
     if mode == "badtier":
         tier = "gpt"
+    if mode == "alias":
+        # A few hundred bytes that expand to tens of megabytes if aliases are followed.
+        bomb = "a: &a [x,x,x,x,x,x,x,x,x]\n" + "".join(
+            "%s: &%s [%s]\n" % (c, c, ",".join(["*" + p] * 9)) for p, c in zip("abcdefgh", "bcdefghi"))
+        (item / "plan.md").write_text("---\n" + bomb + "tier: *i\n---\n## Goal\nTest.\n")
+        ok("planned")
     (item / "plan.md").write_text(
         f"---\ntier: {tier}\nreason: test\nmax_turns: 999\nbudget_usd: 99\n"
         "tools: [Read, Write, WebSearch, Bash]\n---\n## Goal\nTest.\n"
         "## Acceptance criteria\n1. result.md exists\n"
+        + ("padding " * 1000 if mode == "bigplan" else "")
     )
+    if mode == "error-after-plan":
+        # What real Claude Code prints when it runs out of turns: no result text.
+        print(json.dumps({"type": "result", "subtype": "error_max_turns", "is_error": True,
+                          "terminal_reason": "max_turns", "num_turns": 30, "total_cost_usd": 0.02,
+                          "errors": ["Reached maximum number of turns (30)"]}))
+        sys.exit(1)
     ok("planned")
 
 if stage == "execute":
@@ -114,7 +131,7 @@ if stage == "execute":
         ok("too late")
     if mode == "limit-once" and once("limit"):
         limit()
-    if mode == "replan-once" and once("replan"):
+    if mode == "replan-always" or (mode == "replan-once" and once("replan")):
         (item / "result.md").write_text("---\nreplan: true\n---\nThe plan assumed data we do not have.\n")
         ok("replan")
     if mode == "bigout":
@@ -141,6 +158,15 @@ if stage == "execute":
                 lines.append(f"{label}=allowed")
             except OSError:
                 lines.append(f"{label}=blocked")
+        leak = "hidden"
+        for proc_dir in Path("/proc").iterdir():
+            # Another process's view of the disk, if this one is allowed to look through it.
+            try:
+                if proc_dir.name.isdigit() and Path(f"{proc_dir}/root{Path.home()}/.ssh/id_test").exists():
+                    leak = "visible"
+            except OSError:
+                pass
+        lines.append(f"proc_leak={leak}")
         lines.append("token=" + os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "none"))
         (item / "out").mkdir(exist_ok=True)
         (item / "out" / "probe.txt").write_text("\n".join(lines) + "\n")
@@ -152,6 +178,40 @@ if stage == "execute":
             hook.chmod(0o755)
         except OSError:
             pass
+    if mode == "githead":
+        try:
+            (Path.cwd() / ".git" / "refs" / "heads" / "sneaky").write_text("0" * 40 + "\n")
+        except OSError:
+            pass
+    if mode == "symlink":
+        root = Path.cwd().parents[2]
+        outside = root / "outside"
+        outside.mkdir(exist_ok=True)
+        try:
+            shutil.rmtree(item / "log")            # then stand a link where the runner writes its logs
+            os.symlink(outside, item / "log")
+            (item / "out").mkdir(exist_ok=True)
+            os.symlink("/etc/passwd", item / "out" / "passwd")
+            os.symlink(outside, item / "out" / "hidden-link")
+            (item / "out" / ".gitignore").write_text("hidden-link\n")
+        except OSError:
+            pass
+    if mode == "perms":
+        root = Path.cwd().parents[2]
+
+        def mode_of(path):
+            try:
+                return oct(stat.S_IMODE(os.stat(path).st_mode))
+            except OSError:
+                return "ERR"
+
+        seen = {"state": root / "state", "clones": root / "state" / "clones", "clone": Path.cwd(),
+                "git": Path.cwd() / ".git", "gitconfig": Path.cwd() / ".git" / "config",
+                "ledger": root / "state" / "ledger.jsonl", "other_clone": root / "state" / "clones" / "shape",
+                "brief": item / "brief.md", "itemdir": item, "umask": None}
+        (item / "out").mkdir(exist_ok=True)
+        (item / "out" / "perms.txt").write_text(
+            "".join(f"{k}={mode_of(v) if v else oct(os.umask(0o022))}\n" for k, v in seen.items()))
     if mode == "gitswap":
         try:
             os.rename(".git", ".git-real")

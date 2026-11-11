@@ -38,6 +38,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 from email.message import EmailMessage
 from pathlib import Path
 
@@ -52,7 +53,7 @@ except ImportError:  # no PyYAML on this machine: use the copy shipped in lib/
     import yaml
     YAML_SOURCE = "bundled PyYAML"
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 
 STAGES = ["file", "shape", "exec-haiku", "exec-sonnet", "exec-opus", "check"]
 TIERS = ["haiku", "sonnet", "opus"]
@@ -94,6 +95,8 @@ DEFAULTS = {
     "window": {"start": "22:00", "end": "06:00"},
     "max_attempts": 3,
     "max_output_mb": 20,
+    "max_text_mb": 2,
+    "lock_wait_s": 30,
     "allow_web": True,
     "bash_allow": [],
     "limit_wait_min": 30,
@@ -160,6 +163,52 @@ class WorkqError(Exception):
     pass
 
 
+def redact(text):
+    """Hide a password or token written inside a URL (https://user:token@host/...)."""
+    return re.sub(r"(\w+://)[^/@\s]+@", r"\1***@", str(text))
+
+
+TEXT_CAP = 1_000_000
+
+
+def read_text(path, cap=TEXT_CAP):
+    """Up to `cap` bytes of a text file from a clone. Never reads through a symlink."""
+    path = Path(path)
+    if path.is_symlink() or not path.is_file():
+        return ""
+    with open(path, "rb") as fh:
+        return fh.read(cap).decode("utf-8", errors="replace")
+
+
+def write_file(path, text, append=False):
+    """Write a file in a clone, replacing a symlink rather than writing through it."""
+    path = Path(path)
+    if path.is_symlink():
+        path.unlink()
+    with open(path, "a" if append else "w") as fh:
+        fh.write(text)
+
+
+class NoAliasLoader(yaml.SafeLoader):
+    """Safe YAML without aliases, which let a tiny file expand to gigabytes."""
+
+    def compose_node(self, parent, index):
+        if self.check_event(yaml.events.AliasEvent):
+            raise yaml.YAMLError("YAML aliases are not accepted")
+        return super().compose_node(parent, index)
+
+
+def load_yaml(text):
+    return yaml.load(text, Loader=NoAliasLoader)
+
+
+def to_int(value, default=0):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def deep_merge(base, extra):
     out = copy.deepcopy(base)
     for key, value in (extra or {}).items():
@@ -222,7 +271,9 @@ def single_user(cfg):
 def apply_env(cfg):
     """Set the config's env: values for this process, and make ~/.local/bin findable."""
     for key, value in (cfg.get("env") or {}).items():
-        os.environ[str(key)] = expand(value)
+        if value is None or value == "":
+            continue  # a blank line in the config sets nothing
+        os.environ[str(key)] = expand(str(value))
     parts = [x for x in os.environ.get("PATH", "/usr/bin:/bin").split(":") if x]
     for extra in (str(Path.home() / ".local" / "bin"), "/usr/local/bin"):
         if extra not in parts:
@@ -315,10 +366,10 @@ def front_matter(text):
     """Return (dict, body) from a markdown file with optional --- front matter."""
     if text.startswith("---"):
         parts = text.split("\n")
-        for i in range(1, len(parts)):
+        for i in range(1, min(len(parts), 200)):
             if parts[i].strip() == "---":
                 try:
-                    data = yaml.safe_load("\n".join(parts[1:i])) or {}
+                    data = load_yaml("\n".join(parts[1:i])) or {}
                 except yaml.YAMLError:
                     data = {}
                 if not isinstance(data, dict):
@@ -337,12 +388,8 @@ def first_line(text):
 
 
 def title_of(item_dir):
-    brief = item_dir / "brief.md"
-    if brief.exists():
-        line = first_line(brief.read_text(errors="replace"))
-        if line:
-            return line
-    return item_dir.name
+    line = first_line(read_text(item_dir / "brief.md", 20000))
+    return line or item_dir.name
 
 
 def dir_size(path):
@@ -354,7 +401,7 @@ def dir_size(path):
 
 def log(msg):
     stamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"{stamp} {msg}", flush=True)
+    print(f"{stamp} {redact(msg)}", flush=True)
 
 
 # ---------------------------------------------------------------- state files
@@ -369,6 +416,22 @@ class State:
         self.dir.mkdir(parents=True, exist_ok=True)
         (self.dir / "locks").mkdir(exist_ok=True)
         (self.dir / "clones").mkdir(exist_ok=True)
+        self.secure()
+
+    def secure(self):
+        """Keep the runner's bookkeeping private. With a separate agent user, that user
+        may pass through this folder to the clone it is given, and nothing more."""
+        through = 0o700 if single_user(self.cfg) else 0o710
+        wanted = [(self.dir, through), (self.dir / "clones", through), (self.dir / "locks", 0o700)]
+        wanted += [(self.dir / name, 0o600)
+                   for name in ("ledger.jsonl", "problems.jsonl", "limit_until", "last_digest")]
+        wanted += [(path, 0o600) for path in (self.dir / "locks").iterdir()]
+        for path, mode in wanted:
+            try:
+                if not path.is_symlink() and stat.S_IMODE(path.stat().st_mode) != mode:
+                    os.chmod(path, mode)
+            except OSError:
+                pass
 
     def _append(self, name, record):
         with open(self.dir / name, "a") as fh:
@@ -395,6 +458,7 @@ class State:
         return self._read("ledger.jsonl")
 
     def problem(self, stage, item, text):
+        text = redact(text)
         log(f"PROBLEM [{stage}] {item or '-'}: {text}")
         self._append(
             "problems.jsonl",
@@ -430,19 +494,27 @@ class State:
 
 
 class Lock:
-    def __init__(self, state, name):
+    """A file lock. `with Lock(...) as got:` gives False if someone else holds it,
+    after waiting up to `wait` seconds."""
+
+    def __init__(self, state, name, wait=0.0):
         self.path = state.dir / "locks" / f"{name}.lock"
+        self.wait = float(wait)
         self.fh = None
 
     def __enter__(self):
         self.fh = open(self.path, "w")
-        try:
-            fcntl.flock(self.fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            self.fh.close()
-            self.fh = None
-            return False
-        return True
+        deadline = time.time() + self.wait
+        while True:
+            try:
+                fcntl.flock(self.fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return True
+            except BlockingIOError:
+                if time.time() >= deadline:
+                    self.fh.close()
+                    self.fh = None
+                    return False
+                time.sleep(0.2)
 
     def __exit__(self, *exc):
         if self.fh:
@@ -458,6 +530,7 @@ class Repo:
         self.cfg = cfg
         self.path = Path(path)
         self.branch = cfg["branch"]
+        self.removed_links = []
         self.env = dict(os.environ)
         self.env.update(
             GIT_AUTHOR_NAME=cfg["git"]["author_name"],
@@ -491,18 +564,70 @@ class Repo:
         return proc
 
     def sync(self):
-        if not (self.path / ".git").exists():
+        gitdir = self.path / ".git"
+        if gitdir.is_dir() and not gitdir.is_symlink():
+            # Left behind by a run that was killed: a clone still open to the agent
+            # user, and a .git that is still read-only.
+            self.close_for_agent()
+            self.lock_git(False)
+        else:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            if self.path.exists():
-                shutil.rmtree(self.path)
+            if self.path.exists() or self.path.is_symlink():
+                force_rmtree(self.path)
             self.git("clone", "--quiet", "--branch", self.branch, self.cfg["repo_url"],
                      str(self.path), cwd=self.path.parent)
-            if not single_user(self.cfg):
-                self.git("config", "core.sharedRepository", "group")
             self.git("config", "core.quotePath", "false")
+        # 0.1 and 0.2.0 made .git group-writable in two-user mode. Nothing needs that.
+        self.git("config", "--unset-all", "core.sharedRepository", check=False)
         self.git("fetch", "--quiet", "origin", self.branch)
         self.git("reset", "--quiet", "--hard", f"origin/{self.branch}")
         self.git("clean", "-qfdx")
+        # The queue has no use for symbolic links, and the runner must never read or
+        # write through one, so any that arrive are deleted here.
+        self.removed_links = self.strip_symlinks()
+
+    def strip_symlinks(self):
+        """Delete every symbolic link in the working files. Returns their paths."""
+        found = []
+        for root, dirs, files in os.walk(self.path):
+            if root == str(self.path) and ".git" in dirs:
+                dirs.remove(".git")
+            for name in list(dirs) + files:
+                full = os.path.join(root, name)
+                if os.path.islink(full):
+                    try:
+                        os.unlink(full)
+                        found.append(os.path.relpath(full, self.path))
+                    except OSError:
+                        pass
+                    if name in dirs:
+                        dirs.remove(name)
+        return sorted(found)
+
+    def open_for_agent(self):
+        """Two-user mode: let the agent user's group read this clone and write its
+        working files (never .git) for the length of one run."""
+        for root, dirs, files in os.walk(self.path):
+            in_git = root == str(self.path / ".git") or root.startswith(str(self.path / ".git") + os.sep)
+            for path, is_dir in [(root, True)] + [(os.path.join(root, f), False) for f in files]:
+                if os.path.islink(path):
+                    continue
+                try:
+                    mode = stat.S_IMODE(os.lstat(path).st_mode)
+                    if is_dir:
+                        mode = (mode | 0o050) if in_git else 0o2770
+                    else:
+                        mode = (mode | 0o040) if in_git else (mode | 0o060)
+                    os.chmod(path, mode)
+                except OSError:
+                    pass  # a file the agent made in an earlier run: already its own
+
+    def close_for_agent(self):
+        """Shut the clone to everyone but the runner."""
+        try:
+            os.chmod(self.path, 0o700)
+        except OSError:
+            pass
 
     def lock_git(self, locked):
         """Make .git read-only while an agent works in the clone, then writable again."""
@@ -520,17 +645,26 @@ class Repo:
                 pass
 
     def git_fingerprint(self):
-        """Identity of .git, its config and its hooks, to spot a swapped or edited one."""
+        """Identity of .git and a hash of everything in it that decides what git runs
+        or what gets pushed: config, HEAD, the index, every ref and every hook."""
         gitdir = self.path / ".git"
         try:
             st = os.lstat(gitdir)
         except OSError:
             return None
-        config = gitdir / "config"
-        digest = hashlib.sha256(config.read_bytes()).hexdigest() if config.is_file() else None
-        hooks = gitdir / "hooks"
-        names = tuple(sorted(x.name for x in hooks.iterdir())) if hooks.is_dir() else ()
-        return (st.st_ino, st.st_dev, stat.S_ISDIR(st.st_mode), digest, names)
+        files = [gitdir / name for name in
+                 ("config", "HEAD", "index", "packed-refs", "info/exclude", "info/attributes")]
+        for sub in ("refs", "hooks"):
+            for root, _dirs, names in os.walk(gitdir / sub):
+                files += [Path(root) / name for name in names]
+        digest = hashlib.sha256()
+        for path in sorted(files):
+            digest.update(str(path.relative_to(gitdir)).encode() + b"\0")
+            if path.is_symlink():
+                digest.update(b"link:" + os.readlink(path).encode())
+            elif path.is_file():
+                digest.update(hashlib.sha256(path.read_bytes()).digest())
+        return (st.st_ino, st.st_dev, stat.S_ISDIR(st.st_mode), digest.hexdigest())
 
     def changes(self):
         """Paths that differ from HEAD, including untracked files."""
@@ -551,15 +685,16 @@ class Repo:
         return out
 
     def revert(self, path):
+        full = self.path / path
+        if full.is_symlink():
+            full.unlink()  # first, so nothing below follows it
         tracked = self.git("ls-files", "--error-unmatch", "--", path, check=False).returncode == 0
         if tracked:
             self.git("checkout", "HEAD", "--", path)
-        else:
-            full = self.path / path
-            if full.is_dir():
-                shutil.rmtree(full, ignore_errors=True)
-            elif full.exists() or full.is_symlink():
-                full.unlink()
+        elif full.is_dir():
+            force_rmtree(full)
+        elif full.exists():
+            full.unlink()
 
     def commit(self, message):
         self.git("add", "-A")
@@ -595,25 +730,34 @@ class Repo:
 # ---------------------------------------------------------------- items
 
 
+COUNTERS = ("shape_attempts", "execute_attempts", "check_attempts", "check_fails", "runs", "unfinished")
+
+
 def load_meta(item_dir):
-    path = item_dir / "meta.yaml"
-    if path.exists():
-        data = yaml.safe_load(path.read_text()) or {}
-    else:
+    """Read meta.yaml. A missing, broken or hand-mangled file gives clean defaults."""
+    try:
+        data = load_yaml(read_text(item_dir / "meta.yaml")) or {}
+    except yaml.YAMLError:
+        data = {}
+    if not isinstance(data, dict):
         data = {}
     data.setdefault("id", item_dir.name)
     data.setdefault("title", title_of(item_dir))
     data.setdefault("tier", None)
     data.setdefault("status", "active")
-    data.setdefault("history", [])
-    for key in ("shape_attempts", "execute_attempts", "check_attempts", "check_fails", "runs"):
-        data.setdefault(key, 0)
-    data.setdefault("cost_usd", 0.0)
+    if not isinstance(data.get("history"), list):
+        data["history"] = []
+    for key in COUNTERS:
+        data[key] = max(0, to_int(data.get(key)))
+    try:
+        data["cost_usd"] = float(data.get("cost_usd") or 0)
+    except (TypeError, ValueError):
+        data["cost_usd"] = 0.0
     return data
 
 
 def save_meta(item_dir, meta):
-    (item_dir / "meta.yaml").write_text(yaml.safe_dump(meta, sort_keys=False, allow_unicode=True))
+    write_file(item_dir / "meta.yaml", yaml.safe_dump(meta, sort_keys=False, allow_unicode=True))
 
 
 def note_move(cfg, meta, src, dst, note):
@@ -723,11 +867,14 @@ def parse_reset(text, cfg):
         if match.group(3) and match.group(3).lower() == "pm":
             hour += 12
         minute = int(match.group(2) or 0)
-        at = now(cfg)
-        reset = at.replace(hour=hour % 24, minute=minute, second=0, microsecond=0)
-        if reset <= at:
-            reset += dt.timedelta(days=1)
-        return reset.timestamp()
+        if hour <= 23 and minute <= 59:
+            # Claude is started with TZ set to the config's zone, so its clock times
+            # and now(cfg) agree.
+            at = now(cfg)
+            reset = at.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if reset <= at:
+                reset += dt.timedelta(days=1)
+            return reset.timestamp()
     return time.time() + float(cfg["limit_wait_min"]) * 60
 
 
@@ -735,12 +882,17 @@ def claude_env(cfg):
     """Environment for the Claude process."""
     ccfg = cfg["claude"]
     if not single_user(cfg):
-        return dict(os.environ)  # sudo resets it; the wrapper loads the agent's own file
+        env = dict(os.environ)  # sudo resets it; the wrapper loads the agent's own file
+        if cfg.get("timezone"):
+            env["TZ"] = cfg["timezone"]
+        return env
     keep = set(ccfg.get("pass_env") or []) | {str(k) for k in (cfg.get("env") or {})}
     env = {
         k: v for k, v in os.environ.items()
         if k in keep or k.upper() in ENV_KEEP or k.startswith(ENV_KEEP_PREFIX)
     }
+    if cfg.get("timezone"):
+        env["TZ"] = cfg["timezone"]
     env.update(read_env_file(ccfg.get("env_file")))
     if ccfg.get("config_dir"):
         os.makedirs(ccfg["config_dir"], mode=0o700, exist_ok=True)
@@ -776,6 +928,9 @@ def claude_exe(cfg):
 
 
 _BWRAP_WORKS = None
+# Its own user, process and IPC namespaces: from inside, no process outside the
+# sandbox can be seen or reached, so /proc gives no way back to the hidden files.
+BWRAP_ISOLATE = ["--unshare-user-try", "--unshare-pid", "--unshare-ipc"]
 
 
 def bwrap_works():
@@ -786,7 +941,7 @@ def bwrap_works():
         if exe:
             try:
                 probe = subprocess.run(
-                    [exe, "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "true"],
+                    [exe, *BWRAP_ISOLATE, "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "true"],
                     capture_output=True, timeout=20,
                 )
                 _BWRAP_WORKS = probe.returncode == 0
@@ -822,7 +977,7 @@ def sandbox_wrap(cfg, workdir, cmd):
     def is_hidden(path):
         return any(path == h or path.startswith(h + "/") for h in hidden)
 
-    args = [shutil.which("bwrap"), "--die-with-parent", "--ro-bind", "/", "/",
+    args = [shutil.which("bwrap"), *BWRAP_ISOLATE, "--die-with-parent", "--ro-bind", "/", "/",
             "--dev", "/dev", "--proc", "/proc"]
     for path in hidden:
         args += ["--tmpfs", path]
@@ -838,12 +993,48 @@ def sandbox_wrap(cfg, workdir, cmd):
     return args + cmd
 
 
+_LIBC = None
+
+
+def _stop_with_runner():
+    """Runs in the child just before Claude starts: ask the kernel to stop it if the
+    runner dies, so a killed runner doesn't leave an agent working unwatched."""
+    try:
+        _LIBC.prctl(1, int(signal.SIGTERM), 0, 0, 0)  # PR_SET_PDEATHSIG
+    except Exception:
+        pass
+
+
+def stop_child(proc):
+    """End Claude and everything it started. Returns what it had printed."""
+    for sig, patience in ((signal.SIGTERM, 15), (signal.SIGKILL, 30)):
+        try:
+            os.killpg(proc.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            return proc.communicate(timeout=patience)
+        except subprocess.TimeoutExpired:
+            continue
+        except (OSError, ValueError):
+            break
+    return "", ""
+
+
 def run_claude(cfg, repo, stage, item_rel, model, tools, max_turns, budget, timeout_s):
     """Run one headless Claude Code session. Returns a dict describing the run."""
+    global _LIBC
     kind = stage_kind(stage)
     prompt_file = repo.path / "prompts" / f"{kind}.md"
-    if not prompt_file.exists():
-        raise WorkqError(f"missing prompt file prompts/{kind}.md in the queue repo")
+    stage_prompt = read_text(prompt_file)
+    if not stage_prompt.strip():
+        raise WorkqError(f"missing or empty prompt file prompts/{kind}.md in the queue repo")
+    if _LIBC is None:
+        try:
+            import ctypes
+            _LIBC = ctypes.CDLL(None)
+        except Exception:
+            _LIBC = False
     names, allowed = tools
     ccfg = cfg["claude"]
     cmd = []
@@ -862,7 +1053,7 @@ def run_claude(cfg, repo, stage, item_rel, model, tools, max_turns, budget, time
         "--no-session-persistence",
         "--max-turns", str(int(max_turns)),
         "--max-budget-usd", f"{budget:.2f}",
-        "--append-system-prompt", prompt_file.read_text(),
+        "--append-system-prompt", stage_prompt,
     ]
     if ccfg.get("restricted"):
         cmd.append("--restricted")
@@ -893,6 +1084,7 @@ def run_claude(cfg, repo, stage, item_rel, model, tools, max_turns, budget, time
             stderr=subprocess.PIPE,
             text=True,
             start_new_session=True,
+            preexec_fn=_stop_with_runner if _LIBC else None,
         )
     except OSError as exc:
         # Counts as a broken setup: the attempt is given back and the shift stops.
@@ -900,22 +1092,17 @@ def run_claude(cfg, repo, stage, item_rel, model, tools, max_turns, budget, time
             "cmd": cmd, "sandbox": sandbox, "broken": True, "returncode": 127, "timed_out": False,
             "seconds": 0.0, "stdout": "", "stderr": f"cannot start Claude Code ({cmd[0]}): {exc}",
             "result": {}, "cost": 0.0, "turns": None, "failed": True, "limited": False,
-            "reset_at": None, "summary": "",
+            "reset_at": None, "summary": "", "error_text": f"cannot start Claude Code ({cmd[0]}): {exc}",
         }
     timed_out = False
     try:
         stdout, stderr = proc.communicate(prompt, timeout=timeout_s)
     except subprocess.TimeoutExpired:
         timed_out = True
-        try:
-            os.killpg(proc.pid, signal.SIGTERM)
-            stdout, stderr = proc.communicate(timeout=15)
-        except (subprocess.TimeoutExpired, ProcessLookupError):
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            stdout, stderr = proc.communicate()
+        stdout, stderr = stop_child(proc)
+    except BaseException:
+        stop_child(proc)  # the runner is being stopped: take the agent down with it
+        raise
     result = {}
     for line in reversed((stdout or "").strip().splitlines()):
         line = line.strip()
@@ -930,8 +1117,14 @@ def run_claude(cfg, repo, stage, item_rel, model, tools, max_turns, budget, time
             result = json.loads(stdout)
         except json.JSONDecodeError:
             result = {}
+    if not isinstance(result, dict):
+        result = {}
+    # Claude Code puts some failures (turn limit, budget) in an "errors" list.
+    errors = result.get("errors")
+    errors = "; ".join(str(e) for e in errors) if isinstance(errors, list) else str(errors or "")
     text = " ".join(
-        str(x) for x in (result.get("result", ""), result.get("api_error_status") or "", stderr or "", stdout if not result else "")
+        str(x) for x in (result.get("result", ""), errors, result.get("api_error_status") or "",
+                         stderr or "", stdout if not result else "")
     )
     failed = timed_out or proc.returncode != 0 or bool(result.get("is_error"))
     limited = failed and not timed_out and (
@@ -955,7 +1148,8 @@ def run_claude(cfg, repo, stage, item_rel, model, tools, max_turns, budget, time
         "failed": failed,
         "limited": limited,
         "reset_at": parse_reset(text, cfg) if limited else None,
-        "summary": str(result.get("result", ""))[:300],
+        "summary": (str(result.get("result") or "") or errors)[:300],
+        "error_text": (errors or str(result.get("result") or "") or (stderr or stdout or "").strip())[-300:],
     }
 
 
@@ -975,21 +1169,47 @@ def run_stage(cfg, stage):
         repo = Repo(cfg, state.dir / "clones" / stage)
         try:
             repo.sync()
-        except WorkqError as exc:
-            state.problem(stage, None, str(exc))
-            return "error"
-        if is_paused(repo):
-            log(f"[{stage}] PAUSE file present; skipped")
-            return "paused"
-        if stage == "file":
-            return file_stage(cfg, repo, state)
-        if state.limit_until() > time.time():
-            return "limited"
-        try:
+            if repo.removed_links:
+                shown = ", ".join(repo.removed_links[:5])
+                if repo.commit("workq: remove symbolic links (not allowed in the queue)") and repo.push():
+                    state.problem(stage, None, f"removed symbolic links from the queue repo: {shown}")
+            if is_paused(repo):
+                log(f"[{stage}] PAUSE file present; skipped")
+                return "paused"
+            if stage == "file":
+                return file_stage(cfg, repo, state)
+            if state.limit_until() > time.time():
+                return "limited"
             return work_stage(cfg, repo, state, stage)
         except WorkqError as exc:
             state.problem(stage, None, str(exc))
             return "error"
+        except Exception as exc:  # a fault in the runner or the repo must not end the shift
+            traceback.print_exc()
+            state.problem(stage, None, f"unexpected error, stage skipped this pass: "
+                                       f"{type(exc).__name__}: {exc}")
+            return "error"
+
+
+# Items that made the runner fail this session. They are passed over until the next
+# shift, so one bad item can't hold up everything behind it.
+_SET_ASIDE = set()
+
+
+def block_item(cfg, repo, state, stage, item, meta, reason):
+    """Move an item to blocked/ without running anything."""
+    src = SOURCE[stage]
+    meta.pop("running", None)
+    meta["status"] = "blocked"
+    meta["blocked_reason"] = reason
+    note_move(cfg, meta, src, "blocked", reason)
+    save_meta(item, meta)
+    repo.move(f"{src}/{item.name}", f"blocked/{item.name}")
+    repo.commit(f"workq: {item.name} blocked ({reason})"[:200])
+    if not repo.push():
+        state.problem(stage, item.name, "push clashed while blocking; will retry next pass")
+        return
+    log(f"[{stage}] {item.name}: blocked ({reason})")
 
 
 def work_stage(cfg, repo, state, stage):
@@ -998,10 +1218,25 @@ def work_stage(cfg, repo, state, stage):
     settings_args(cfg)
     if kind == "shape":
         tidy_inbox(cfg, repo, state)
-    items = [p for p in list_items(repo, SOURCE[stage]) if (p / "brief.md").exists()]
+    items = [p for p in list_items(repo, SOURCE[stage])
+             if (p / "brief.md").is_file() and p.name not in _SET_ASIDE]
     if not items:
         return "idle"
     item = items[0]
+    try:
+        return work_item(cfg, repo, state, stage, item)
+    except WorkqError:
+        raise
+    except Exception as exc:
+        traceback.print_exc()
+        _SET_ASIDE.add(item.name)
+        state.problem(stage, item.name, f"unexpected error, item set aside until the next shift: "
+                                        f"{type(exc).__name__}: {exc}")
+        return "skipped"
+
+
+def work_item(cfg, repo, state, stage, item):
+    kind = stage_kind(stage)
     item_rel = f"{SOURCE[stage]}/{item.name}"
     scfg = cfg["stages"][stage]
     tier = scfg["tier"]
@@ -1013,9 +1248,17 @@ def work_stage(cfg, repo, state, stage):
 
     meta = load_meta(item)
     attempts_key = f"{kind}_attempts"
+    if meta.get("running"):
+        # The last run of this item never reported back: the runner was killed, the
+        # machine went down, or its result could not be pushed.
+        meta["unfinished"] += 1
+        if meta["unfinished"] >= int(cfg["max_attempts"]):
+            block_item(cfg, repo, state, stage, item, meta,
+                       f"{meta['unfinished']} runs ended without finishing (killed, crashed or not pushed)")
+            return "done"
     plan = {}
     if kind == "execute":
-        plan, _ = front_matter((item / "plan.md").read_text(errors="replace")) if (item / "plan.md").exists() else ({}, "")
+        plan, _ = front_matter(read_text(item / "plan.md"))
     max_turns = clamp_number(plan.get("max_turns", scfg["max_turns"]), scfg["max_turns"])
     budget = clamp_number(plan.get("budget_usd", scfg["budget_usd"]), scfg["budget_usd"])
     tools = stage_tools(cfg, kind, plan if kind == "execute" else None)
@@ -1038,6 +1281,8 @@ def work_stage(cfg, repo, state, stage):
     owned = OWNS[kind]
     before = {name: file_hash(item / name) for name in owned if not name.endswith("/")}
     log(f"[{stage}] {item.name}: running {cfg['models'][tier]} (attempt {meta[attempts_key]})")
+    if not single_user(cfg):
+        repo.open_for_agent()
     git_before = repo.git_fingerprint()
     repo.lock_git(True)
     try:
@@ -1046,6 +1291,7 @@ def work_stage(cfg, repo, state, stage):
             float(scfg["timeout_min"]) * 60,
         )
     finally:
+        repo.close_for_agent()
         git_after = repo.git_fingerprint()
         if git_after == git_before:
             repo.lock_git(False)
@@ -1083,7 +1329,7 @@ def work_stage(cfg, repo, state, stage):
         meta[attempts_key] = max(0, meta[attempts_key] - 1)
         save_meta(item, meta)
         write_log(item, stamp, stage, raw)
-        detail = (run["summary"] or run["stderr"] or run["stdout"]).strip()[-300:]
+        detail = (run["summary"] or run["error_text"] or run["stderr"] or run["stdout"]).strip()[-300:]
         state.ledger_add(stage=stage, tier=tier, item=item.name, cost=run["cost"],
                          turns=run["turns"], outcome="broken", reason=detail)
         state.problem(stage, item.name, f"Claude Code failed to run; shift stopped: {detail}")
@@ -1108,9 +1354,13 @@ def work_stage(cfg, repo, state, stage):
         repo.push()
         return "limited"
 
-    # Guard: anything outside the stage's own files is thrown away.
+    # Guard: anything outside the stage's own files is thrown away, and so is any
+    # symbolic link, wherever it is.
     violations = []
     for _, path in repo.changes():
+        if os.path.islink(repo.path / path):
+            violations.append(path)
+            continue
         if not path.startswith(item_rel + "/"):
             violations.append(path)
             continue
@@ -1119,6 +1369,8 @@ def work_stage(cfg, repo, state, stage):
             violations.append(path)
     for path in sorted(set(violations)):
         repo.revert(path)
+    # git doesn't report what a .gitignore hides, so look for links directly as well.
+    violations += [f"{link} (symbolic link)" for link in repo.strip_symlinks()]
     meta = settle_meta()
 
     outcome, dst, reason = decide(cfg, repo, item, item_rel, kind, meta, before, run, violations)
@@ -1148,7 +1400,10 @@ def work_stage(cfg, repo, state, stage):
 def write_log(item, stamp, stage, raw):
     logdir = item / "log"
     logdir.mkdir(exist_ok=True)
-    (logdir / f"{stamp}-{stage}.json").write_text(json.dumps(raw, indent=2, default=str))
+    path, n = logdir / f"{stamp}-{stage}.json", 2
+    while path.exists() or path.is_symlink():   # two runs in one second: keep both
+        path, n = logdir / f"{stamp}-{stage}-{n}.json", n + 1
+    write_file(path, json.dumps(raw, indent=2, default=str))
 
 
 def revert_owned(repo, item_rel):
@@ -1177,8 +1432,15 @@ def decide(cfg, repo, item, item_rel, kind, meta, before, run, violations):
     if violations:
         shown = ", ".join(sorted(set(violations))[:5])
         return fail(f"wrote files it does not own: {shown}")
-    if run["failed"] and not run["result"]:
-        return fail(f"claude exited {run['returncode']}: {(run['stderr'] or run['stdout'])[-300:].strip()}")
+    if run["failed"]:
+        # Claude ended in an error (turn or budget limit, API fault). Whatever it
+        # left behind may be half written, so none of it is used.
+        return fail(f"claude ended with an error: {run['error_text'].strip() or 'exit %s' % run['returncode']}")
+    limit = float(cfg["max_text_mb"]) * 1024 * 1024
+    for name in OWNS[kind]:
+        path = item / name
+        if not name.endswith("/") and path.is_file() and path.stat().st_size > limit:
+            return fail(f"{name} is over {cfg['max_text_mb']} MB")
 
     if kind == "shape":
         q_changed = file_hash(item / "questions.md") != before.get("questions.md")
@@ -1188,7 +1450,7 @@ def decide(cfg, repo, item, item_rel, kind, meta, before, run, violations):
                 repo.revert(f"{item_rel}/plan.md")
             return "blocked", f"blocked/{item.name}", "shaper has questions"
         if p_changed and (item / "plan.md").exists():
-            fm, _ = front_matter((item / "plan.md").read_text(errors="replace"))
+            fm, _ = front_matter(read_text(item / "plan.md"))
             tier = str(fm.get("tier", "")).strip().lower()
             if tier in TIERS:
                 meta["tier"] = tier
@@ -1202,15 +1464,18 @@ def decide(cfg, repo, item, item_rel, kind, meta, before, run, violations):
         limit = float(cfg["max_output_mb"]) * 1024 * 1024
         if dir_size(item / "out") > limit:
             return fail(f"out/ is over {cfg['max_output_mb']} MB")
-        fm, _ = front_matter((item / "result.md").read_text(errors="replace"))
+        fm, _ = front_matter(read_text(item / "result.md"))
         if fm.get("replan") is True or str(fm.get("replan", "")).lower() == "true":
+            if meta["shape_attempts"] >= max_attempts:
+                return ("blocked", f"blocked/{item.name}",
+                        f"executor asked for a new plan after {meta['shape_attempts']} plans")
             return "replan", f"inbox/{item.name}", "executor asked for a new plan"
         return "executed", f"check/{item.name}", f"result written at {meta.get('tier')}"
 
     if kind == "check":
         if file_hash(item / "check.md") == before.get("check.md") or not (item / "check.md").exists():
             return fail(f"no new check.md ({run['summary'][:120]})")
-        fm, _ = front_matter((item / "check.md").read_text(errors="replace"))
+        fm, _ = front_matter(read_text(item / "check.md"))
         verdict = str(fm.get("verdict", "")).strip().lower()
         if verdict == "pass":
             meta["status"] = "review"
@@ -1235,7 +1500,7 @@ VERDICTS = {"review": {"approve", "rework", "reject"}, "blocked": {"retry", "rej
 
 
 def read_verdict(path):
-    text = path.read_text(errors="replace")
+    text = read_text(path)
     fm, body = front_matter(text)
     verdict = str(fm.get("verdict", "")).strip().lower()
     if not verdict:
@@ -1250,65 +1515,88 @@ def file_stage(cfg, repo, state):
     did = False
     for folder in ("review", "blocked"):
         for item in list_items(repo, folder):
-            review = item / "review.md"
-            if not review.exists():
+            if not (item / "review.md").is_file() or item.name in _SET_ASIDE:
                 continue
-            if not (item / "meta.yaml").exists():
-                state.problem("file", item.name, f"{folder}/{item.name} is not a work item "
-                              "(no meta.yaml); review.md left alone")
+            try:
+                outcome = file_item(cfg, repo, state, folder, item)
+            except WorkqError:
+                raise
+            except Exception as exc:
+                traceback.print_exc()
+                _SET_ASIDE.add(item.name)
+                state.problem("file", item.name, f"unexpected error, item set aside until the next "
+                                                 f"shift: {type(exc).__name__}: {exc}")
+                # Start the next item from a clean copy.
+                repo.git("reset", "--quiet", "--hard", f"origin/{repo.branch}")
+                repo.git("clean", "-qfdx")
                 continue
-            verdict, notes = read_verdict(review)
-            if verdict not in VERDICTS[folder]:
-                state.problem("file", item.name, f"review.md verdict '{verdict}' not valid in {folder}/; "
-                              f"use one of {', '.join(sorted(VERDICTS[folder]))}")
-                continue
-            meta = load_meta(item)
-            stamp = now(cfg).strftime("%Y-%m-%d %H:%M")
-            with open(item / "notes.md", "a") as fh:
-                fh.write(f"\n## Your notes, {stamp} ({verdict})\n\n{notes or '(none)'}\n")
-            repo.git("rm", "--quiet", "-f", f"{folder}/{item.name}/review.md")
-            item_rel = f"{folder}/{item.name}"
-            if verdict in ("rework", "retry"):
-                for key in ("shape_attempts", "execute_attempts", "check_attempts", "check_fails"):
-                    meta[key] = 0
-                meta["status"] = "active"
-                meta.pop("blocked_reason", None)
-                note_move(cfg, meta, folder, "inbox", f"you asked for {verdict}")
-                save_meta(item, meta)
-                dst = repo.move(item_rel, f"inbox/{item.name}")
-            else:
-                meta["status"] = "approved" if verdict == "approve" else "rejected"
-                month = now(cfg).strftime("%Y-%m")
-                note_move(cfg, meta, folder, "archive", f"you chose {verdict}")
-                meta["archived"] = now(cfg).date().isoformat()
-                save_meta(item, meta)
-                dst = repo.move(item_rel, f"archive/{month}/{item.name}")
-                add_index_line(repo, meta, dst)
-            log(f"[file] {item.name}: {verdict} -> {dst}")
-            repo.commit(f"workq: {item.name} {verdict} -> {dst.split('/')[0]}")
-            if not repo.push():
-                state.problem("file", item.name, "push clashed; will retry next pass")
+            if outcome == "error":
                 return "error"
-            did = True
+            did = did or outcome == "done"
     return "done" if did else "idle"
+
+
+def file_item(cfg, repo, state, folder, item):
+    """Act on one review.md. Returns done, skipped or error."""
+    review = item / "review.md"
+    if not (item / "meta.yaml").is_file():
+        state.problem("file", item.name, f"{folder}/{item.name} is not a work item "
+                      "(no meta.yaml); review.md left alone")
+        return "skipped"
+    verdict, notes = read_verdict(review)
+    if verdict not in VERDICTS[folder]:
+        state.problem("file", item.name, f"review.md verdict '{verdict}' not valid in {folder}/; "
+                      f"use one of {', '.join(sorted(VERDICTS[folder]))}")
+        return "skipped"
+    meta = load_meta(item)
+    stamp = now(cfg).strftime("%Y-%m-%d %H:%M")
+    write_file(item / "notes.md", f"\n## Your notes, {stamp} ({verdict})\n\n{notes or '(none)'}\n",
+               append=True)
+    repo.git("rm", "--quiet", "-f", f"{folder}/{item.name}/review.md")
+    item_rel = f"{folder}/{item.name}"
+    if verdict in ("rework", "retry"):
+        for key in ("shape_attempts", "execute_attempts", "check_attempts", "check_fails", "unfinished"):
+            meta[key] = 0
+        meta.pop("running", None)
+        meta["status"] = "active"
+        meta.pop("blocked_reason", None)
+        note_move(cfg, meta, folder, "inbox", f"you asked for {verdict}")
+        save_meta(item, meta)
+        dst = repo.move(item_rel, f"inbox/{item.name}")
+    else:
+        meta["status"] = "approved" if verdict == "approve" else "rejected"
+        month = now(cfg).strftime("%Y-%m")
+        note_move(cfg, meta, folder, "archive", f"you chose {verdict}")
+        meta["archived"] = now(cfg).date().isoformat()
+        save_meta(item, meta)
+        dst = repo.move(item_rel, f"archive/{month}/{item.name}")
+        add_index_line(repo, meta, dst)
+    log(f"[file] {item.name}: {verdict} -> {dst}")
+    repo.commit(f"workq: {item.name} {verdict} -> {dst.split('/')[0]}")
+    if not repo.push():
+        state.problem("file", item.name, "push clashed; will retry next pass")
+        return "error"
+    return "done"
 
 
 def add_index_line(repo, meta, dst):
     index = repo.path / "archive" / "INDEX.md"
-    if not index.exists():
+    if not index.is_file():
         index.parent.mkdir(parents=True, exist_ok=True)
-        index.write_text(
+        write_file(
+            index,
             "# Archive index\n\n"
             "| Archived | Item | Title | Tier | Runs | Est. cost (USD) | Outcome |\n"
             "| --- | --- | --- | --- | --- | --- | --- |\n"
         )
-    title = str(meta.get("title", "")).replace("|", "/")
-    with open(index, "a") as fh:
-        fh.write(
-            f"| {meta.get('archived')} | [{meta['id']}]({dst[len('archive/'):]}) | {title} | "
-            f"{meta.get('tier') or '-'} | {meta.get('runs', 0)} | {float(meta.get('cost_usd') or 0):.2f} | "
-            f"{meta.get('status')} |\n"
-        )
+    title = str(meta.get("title", "")).replace("|", "/").replace("\n", " ")
+    write_file(
+        index,
+        f"| {meta.get('archived')} | [{meta['id']}]({dst[len('archive/'):]}) | {title} | "
+        f"{meta.get('tier') or '-'} | {meta.get('runs', 0)} | {float(meta.get('cost_usd') or 0):.2f} | "
+        f"{meta.get('status')} |\n",
+        append=True,
+    )
 
 
 # ---------------------------------------------------------------- night
@@ -1322,6 +1610,7 @@ def night(cfg, until=None, max_passes=100):
             return 0
         end = shift_end(cfg, until)
         log(f"night shift until {end:%Y-%m-%d %H:%M}")
+        broken = False
         for n in range(max_passes):
             progress = False
             stopped = False
@@ -1335,6 +1624,8 @@ def night(cfg, until=None, max_passes=100):
                     if status == "done":
                         progress = True
                         continue
+                    if status == "skipped":
+                        continue  # one item was set aside; carry on with the rest
                     if status == "limited":
                         reset = dt.datetime.fromtimestamp(state.limit_until()).astimezone()
                         if reset + dt.timedelta(seconds=budget_s) < end:
@@ -1346,13 +1637,15 @@ def night(cfg, until=None, max_passes=100):
                         stopped = True
                     if status in ("paused", "broken"):
                         stopped = True
+                        broken = broken or status == "broken"
                     break
                 if stopped:
                     break
             if stopped or not progress:
                 break
-        log(f"night shift over after {n + 1} pass(es)")
-        return 0
+        log(f"night shift over after {n + 1} pass(es)"
+            + (": stopped because Claude Code could not run" if broken else ""))
+        return 1 if broken else 0
 
 
 # ---------------------------------------------------------------- digest
@@ -1386,7 +1679,7 @@ def build_digest(cfg, repo, state):
         if entered:
             days = (now(cfg) - dt.datetime.fromisoformat(entered)).days
             waited = f", waiting {days} day{'s' if days != 1 else ''}" if days else ", new"
-        summary = first_line((item / "result.md").read_text(errors="replace")) if (item / "result.md").exists() else ""
+        summary = first_line(read_text(item / "result.md", 20000))
         lines.append(f"- {meta['title']} [{meta.get('tier') or '-'}{waited}]")
         if summary:
             lines.append(f"  {summary}")
@@ -1399,8 +1692,8 @@ def build_digest(cfg, repo, state):
     for item in blocked:
         meta = load_meta(item)
         lines.append(f"- {meta['title']}: {meta.get('blocked_reason', 'blocked')}")
-        if (item / "questions.md").exists():
-            _, body = front_matter((item / "questions.md").read_text(errors="replace"))
+        if (item / "questions.md").is_file():
+            _, body = front_matter(read_text(item / "questions.md", 20000))
             for q in [l for l in body.splitlines() if l.strip()][:4]:
                 lines.append(f"  {q.strip()[:160]}")
         lines.append(f"  {link('blocked/' + item.name)}")
@@ -1453,6 +1746,14 @@ def send_mail(cfg, subject, body):
     smtp = dcfg.get("smtp") or {}
     if smtp.get("host"):
         # Built in: needs no mail program on the machine.
+        encrypted = bool(smtp.get("ssl")) or bool(smtp.get("starttls", True))
+        local = str(smtp["host"]).lower() in ("localhost", "127.0.0.1", "::1")
+        if smtp.get("user"):
+            if not smtp.get("password_file"):
+                return "digest.smtp.user is set but digest.smtp.password_file is not"
+            if not encrypted and not local:
+                return ("refusing to send the mail password unencrypted: set digest.smtp.starttls "
+                        "or digest.smtp.ssl to true, or remove digest.smtp.user")
         try:
             port = int(smtp.get("port") or 587)
             if smtp.get("ssl"):
@@ -1464,8 +1765,6 @@ def send_mail(cfg, subject, body):
                 if smtp.get("starttls", True) and not smtp.get("ssl"):
                     server.starttls(context=ssl.create_default_context())
                 if smtp.get("user"):
-                    if not smtp.get("password_file"):
-                        return "digest.smtp.user is set but digest.smtp.password_file is not"
                     server.login(smtp["user"], Path(smtp["password_file"]).read_text().strip())
                 server.send_message(msg)
         except (OSError, smtplib.SMTPException) as exc:
@@ -1514,12 +1813,26 @@ def tools_repo(cfg):
     return state, repo
 
 
+class tools_lock:
+    """These commands share one clone, so each waits its turn or gives up."""
+
+    def __init__(self, cfg, state):
+        self.lock = Lock(state, "tools", wait=float(cfg["lock_wait_s"]))
+
+    def __enter__(self):
+        if not self.lock.__enter__():
+            raise WorkqError("another workq command is still running; try again in a moment")
+
+    def __exit__(self, *exc):
+        self.lock.__exit__(*exc)
+
+
 def cmd_init(cfg):
     state, repo = tools_repo(cfg)
     template = Path(__file__).resolve().parent.parent / "template"
     if not template.exists():
         raise WorkqError(f"template folder not found at {template}")
-    with Lock(state, "tools"):
+    with tools_lock(cfg, state):
         work = Path(tempfile.mkdtemp(prefix="workq-init-"))
         try:
             probe = repo.git("ls-remote", cfg["repo_url"], check=False, cwd=work)
@@ -1539,7 +1852,7 @@ def cmd_init(cfg):
 
 def cmd_add(cfg, title, file=None, text=None):
     state, repo = tools_repo(cfg)
-    with Lock(state, "tools"):
+    with tools_lock(cfg, state):
         repo.sync()
         name = f"{now(cfg).date().isoformat()}-{slugify(title)}"
         folder = repo.path / "inbox" / name
@@ -1549,7 +1862,7 @@ def cmd_add(cfg, title, file=None, text=None):
             n += 1
         folder.mkdir(parents=True)
         body = Path(file).read_text() if file else (text or "")
-        (folder / "brief.md").write_text(f"# {title}\n\n{body.strip()}\n")
+        write_file(folder / "brief.md", f"# {title}\n\n{body.strip()}\n")
         repo.commit(f"workq: add {folder.name}")
         if not repo.push():
             raise WorkqError("push failed")
@@ -1558,11 +1871,11 @@ def cmd_add(cfg, title, file=None, text=None):
 
 def cmd_pause(cfg, on):
     state, repo = tools_repo(cfg)
-    with Lock(state, "tools"):
+    with tools_lock(cfg, state):
         repo.sync()
         flag = repo.path / "PAUSE"
         if on:
-            flag.write_text("Delete this file to let workq run again.\n")
+            write_file(flag, "Delete this file to let workq run again.\n")
         elif flag.exists():
             flag.unlink()
         repo.commit("workq: pause" if on else "workq: resume")
@@ -1573,7 +1886,7 @@ def cmd_pause(cfg, on):
 
 def cmd_status(cfg):
     state, repo = tools_repo(cfg)
-    with Lock(state, "tools"):
+    with tools_lock(cfg, state):
         repo.sync()
         if is_paused(repo):
             print("PAUSED")
@@ -1701,13 +2014,18 @@ def crontab_read():
 
 
 def strip_cron_block(text):
+    """Remove the block `workq schedule on` wrote, and nothing else. If its end marker
+    has gone missing, only lines that are plainly workq's own are taken out."""
+    ours = re.compile(r"^CRON_TZ=|/workq['\"]? --config .* (night|digest)\b")
     out, skipping = [], False
     for line in text.splitlines():
         if line.strip() == CRON_BEGIN:
             skipping = True
         elif line.strip() == CRON_END:
             skipping = False
-        elif not skipping:
+        elif skipping and ours.search(line.strip()):
+            continue
+        else:
             out.append(line)
     return "\n".join(out).rstrip("\n") + ("\n" if out else "")
 
@@ -1949,6 +2267,9 @@ def cmd_doctor(cfg, live=False):
                  "by Claude Code's own restricted mode only. An admin can add it: dnf install bubblewrap")
 
     # Queue repo
+    if redact(cfg["repo_url"]) != str(cfg["repo_url"]):
+        bad("repo_url has a password or token in it, which ends up in logs and git's own "
+            "config. Take it out and put it in the file named by git.credential_file")
     repo = Repo(cfg, cfg["state_dir"])
     code, out, err = run_quiet([*repo.base, "ls-remote", "--heads", cfg["repo_url"]], timeout=45, env=repo.env)
     if code != 0:
@@ -2013,7 +2334,7 @@ def cmd_doctor(cfg, live=False):
             bad("live test failed: " + (str(reply.get("result") or "") or err.strip() or out.strip())[:300])
 
     for level, text in rows:
-        print(f"[{level}] {text}")
+        print(f"[{level}] {redact(text)}")
     fails = sum(1 for level, _ in rows if level == "FAIL")
     warns = sum(1 for level, _ in rows if level == "WARN")
     print(f"\n{fails} problem(s), {warns} warning(s).")
@@ -2051,10 +2372,18 @@ def main(argv=None):
     p.add_argument("--scheduler", choices=["auto", "systemd", "cron"], default="auto")
     args = parser.parse_args(argv)
     signal.signal(signal.SIGPIPE, signal.SIG_DFL)  # quiet exit when piped into head
+
+    def stop(signum, _frame):
+        # Unwind normally, so a running agent is stopped and its clone is unlocked.
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGHUP, stop)
     try:
         cfg = load_config(args.config)
-        # Two users share the clones through a group; one user keeps everything private.
-        os.umask(0o077 if single_user(cfg) else 0o002)
+        # Everything the runner writes is private. In two-user mode the one clone an
+        # agent is working in is opened to it for the length of that run.
+        os.umask(0o077)
         apply_env(cfg)
         if args.cmd == "doctor":
             return cmd_doctor(cfg, args.live)
@@ -2067,7 +2396,7 @@ def main(argv=None):
         elif args.cmd == "run":
             status = run_stage(cfg, args.stage)
             log(f"[{args.stage}] {status}")
-            return 1 if status in ("error", "broken") else 0
+            return 1 if status in ("error", "broken", "skipped") else 0
         elif args.cmd == "night":
             return night(cfg, args.until)
         elif args.cmd == "digest":
@@ -2077,8 +2406,12 @@ def main(argv=None):
         elif args.cmd in ("pause", "resume"):
             cmd_pause(cfg, args.cmd == "pause")
     except WorkqError as exc:
-        print(f"workq: {exc}", file=sys.stderr)
+        print(f"workq: {redact(exc)}", file=sys.stderr)
         return 1
+    except Exception as exc:
+        traceback.print_exc()
+        print(f"workq: unexpected error: {type(exc).__name__}: {redact(exc)}", file=sys.stderr)
+        return 2
     return 0
 
 

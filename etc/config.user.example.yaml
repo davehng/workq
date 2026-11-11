@@ -36,6 +36,7 @@ extra_shifts: []
 
 max_attempts: 3        # per stage, per round of review
 max_output_mb: 20      # largest out/ folder an executor may produce
+max_text_mb: 2         # largest plan.md, result.md, check.md or questions.md
 allow_web: true        # false removes WebSearch/WebFetch from every stage
 limit_wait_min: 30     # wait after a usage limit when the reset time can't be read
 

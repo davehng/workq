@@ -60,7 +60,9 @@ if [[ ! -f "$ETC/agent.env" ]]; then
 fi
 
 echo "== state folder"
-install -d -m 2770 -o workq -g workq "$STATE"
+# The agent user (in group workq) may pass through to the one clone the runner opens
+# for it during a run. It cannot list or write anything else here.
+install -d -m 0710 -o workq -g workq "$STATE"
 
 echo "== sudo rule (runner may start Claude as workq-agent, nothing else)"
 install -m 440 "$SRC/etc/sudoers.workq" /etc/sudoers.d/workq

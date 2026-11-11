@@ -59,8 +59,12 @@ caps:
   sonnet: {runs: 20, usd: 20}
   opus:   {runs: 15, usd: 30}
 
+# Email is optional: set `to: null` and the digest is written to DIGEST.md at the top of
+# the queue repo instead. repo_file: auto = that file only when there is no email;
+# a file name (or true) = always write it, as well as the email; off = never.
 digest:
   to: you@example.com
+  repo_file: auto
   from: workq@example.com
   subject: workq digest
   # Route 1: any command that reads a full message on stdin.

@@ -107,7 +107,7 @@ cat <<EOF
 Next:
   1. Add the key above to the repo (or set up HTTPS with a token).
   2. Put the Claude token in $CONF/claude.env
-  3. Edit $CONF/config.yaml (repo_url, web_url, digest, caps)
+  3. Edit $CONF/config.yaml (repo_url, web_url, caps; email is optional)
   4. workq doctor --live      checks everything, including one tiny real call to Claude
   5. workq init               fills an empty queue repo (skip if it is already set up)
   6. workq schedule on        turns on the nightly shift and the morning digest

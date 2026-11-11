@@ -7,7 +7,8 @@ Commands
   workq run STAGE            run one stage once (file, shape, exec-haiku,
                              exec-sonnet, exec-opus, check)
   workq night [--until HH:MM]  run the overnight shift
-  workq digest [--stdout]    build and send the morning email
+  workq digest [--stdout]    build the digest: email it, write it to the
+                             queue repo, or both
   workq status               show what is in each folder
   workq pause | resume       add or remove the PAUSE file
   workq doctor [--live]      check this machine is set up to run workq
@@ -53,7 +54,7 @@ except ImportError:  # no PyYAML on this machine: use the copy shipped in lib/
     import yaml
     YAML_SOURCE = "bundled PyYAML"
 
-VERSION = "0.2.1"
+VERSION = "0.2.2"
 
 STAGES = ["file", "shape", "exec-haiku", "exec-sonnet", "exec-opus", "check"]
 TIERS = ["haiku", "sonnet", "opus"]
@@ -132,7 +133,8 @@ DEFAULTS = {
         "opus": {"runs": 15, "usd": 30.0},
     },
     "digest": {
-        "to": None,
+        "to": None,                # empty = no email
+        "repo_file": "auto",       # auto = DIGEST.md in the queue repo when there is no email
         "from": "workq@localhost",
         "subject": "workq digest",
         "at": "06:30",
@@ -235,6 +237,34 @@ def expand(path):
     return os.path.expanduser(os.path.expandvars(str(path)))
 
 
+DIGEST_FILE = "DIGEST.md"
+_RESERVED_NAMES = {"claude.md", "readme.md", "pause", "inbox", "ready", "check", "review",
+                   "blocked", "archive", "prompts"}
+
+
+def digest_file_setting(value):
+    """digest.repo_file as "auto", None (never), or a file name at the top of the queue repo."""
+    if value is None or value is False or str(value).strip().lower() in ("", "off", "never", "none"):
+        return None
+    if value is True or str(value).strip().lower() in ("on", "always"):
+        return DIGEST_FILE
+    value = str(value).strip()
+    if value.lower() == "auto":
+        return "auto"
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,80}", value) or value.lower() in _RESERVED_NAMES:
+        raise WorkqError(f"config: digest.repo_file must be auto, off, or a plain file name such as "
+                         f"{DIGEST_FILE} (not a path, and not a name the queue uses): {value!r}")
+    return value
+
+
+def digest_file(cfg):
+    """The file the digest is written to in the queue repo, or None."""
+    value = cfg["digest"]["repo_file"]
+    if value == "auto":
+        return None if cfg["digest"].get("to") else DIGEST_FILE
+    return value
+
+
 def load_config(path):
     path = Path(path)
     if not path.exists():
@@ -252,6 +282,8 @@ def load_config(path):
     for key in ("ssh_key", "credential_file"):
         cfg["git"][key] = expand(cfg["git"].get(key))
     cfg["digest"]["smtp"] = cfg["digest"].get("smtp") or {}
+    cfg["digest"]["to"] = str(cfg["digest"].get("to") or "").strip() or None
+    cfg["digest"]["repo_file"] = digest_file_setting(cfg["digest"].get("repo_file", "auto"))
     cfg["digest"]["smtp"]["password_file"] = expand(cfg["digest"]["smtp"].get("password_file"))
     # Clock times: YAML reads an unquoted 22:00 as the number 1320, so accept both.
     cfg["window"] = {k: clock(v) for k, v in cfg["window"].items()}
@@ -399,9 +431,20 @@ def dir_size(path):
     return sum(p.stat().st_size for p in path.rglob("*") if p.is_file())
 
 
+def quiet_stdout():
+    """The reader of our output has gone (`workq ... | head`): send the rest nowhere."""
+    try:
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+    except (OSError, ValueError):
+        pass
+
+
 def log(msg):
     stamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"{stamp} {redact(msg)}", flush=True)
+    try:
+        print(f"{stamp} {redact(msg)}", flush=True)
+    except BrokenPipeError:
+        quiet_stdout()   # keep working: a shift must not die because nobody is reading
 
 
 # ---------------------------------------------------------------- state files
@@ -1651,27 +1694,55 @@ def night(cfg, until=None, max_passes=100):
 # ---------------------------------------------------------------- digest
 
 
-def build_digest(cfg, repo, state):
+def md_escape(text):
+    """Make text from briefs and agents show as plain text in a Markdown file."""
+    return re.sub(r"([\\`*_<>\[\]|#~])", r"\\\1", str(text))
+
+
+def build_digest(cfg, repo, state, md=False):
+    """The digest as plain text (for mail and the terminal) or as Markdown (for the repo file)."""
     web = cfg["web_url"].rstrip("/")
 
     def link(rel):
-        return f"{web}/{rel}" if web else rel
+        url = f"{web}/{rel}" if web else rel
+        return f"[{rel}]({url})" if md else url
+
+    def t(text):
+        return md_escape(text) if md else text
+
+    def head(text):
+        if md:
+            lines.extend([f"## {text.capitalize()}", ""])
+        else:
+            lines.append(text)
+
+    def nothing(word):
+        lines.append(f"{word.capitalize()}." if md else f"  {word}")
+
+    def sub(text):
+        lines.append(f"  - {text}" if md else f"  {text}")
 
     since = state.last_digest() or "0000"
     sid = shift_id(cfg)
     lines = []
     review = list_items(repo, "review")
     blocked = list_items(repo, "blocked")
-    lines.append(f"workq digest, {now(cfg):%A %d %B %Y}")
-    lines.append(f"{len(review)} for review, {len(blocked)} blocked, "
-                 f"{len(list_items(repo, 'inbox'))} waiting in inbox")
+    counts = (f"{len(review)} for review, {len(blocked)} blocked, "
+              f"{len(list_items(repo, 'inbox'))} waiting in inbox")
+    if md:
+        zone = f" ({cfg['timezone']})" if cfg.get("timezone") else ""
+        lines.extend([f"# workq digest, {now(cfg):%A %d %B %Y}", "",
+                      f"Written at {now(cfg):%H:%M}{zone}. {counts}."])
+    else:
+        lines.append(f"workq digest, {now(cfg):%A %d %B %Y}")
+        lines.append(counts)
     if is_paused(repo):
-        lines.append("PAUSE file is set: nothing ran.")
+        lines.extend(["", "**PAUSE file is set: nothing ran.**"] if md else ["PAUSE file is set: nothing ran."])
     lines.append("")
 
-    lines.append(f"FOR REVIEW ({len(review)})")
+    head(f"FOR REVIEW ({len(review)})")
     if not review:
-        lines.append("  nothing")
+        nothing("nothing")
     for item in review:
         meta = load_meta(item)
         entered = next((h["at"] for h in reversed(meta["history"]) if h.get("to") == "review"), None)
@@ -1680,23 +1751,28 @@ def build_digest(cfg, repo, state):
             days = (now(cfg) - dt.datetime.fromisoformat(entered)).days
             waited = f", waiting {days} day{'s' if days != 1 else ''}" if days else ", new"
         summary = first_line(read_text(item / "result.md", 20000))
-        lines.append(f"- {meta['title']} [{meta.get('tier') or '-'}{waited}]")
+        if md:
+            lines.append(f"- **{t(meta['title'])}** ({meta.get('tier') or '-'}{waited})")
+        else:
+            lines.append(f"- {meta['title']} [{meta.get('tier') or '-'}{waited}]")
         if summary:
-            lines.append(f"  {summary}")
-        lines.append(f"  {link('review/' + item.name)}")
+            sub(t(summary))
+        sub(link('review/' + item.name))
     lines.append("")
 
-    lines.append(f"BLOCKED ({len(blocked)})")
+    head(f"BLOCKED ({len(blocked)})")
     if not blocked:
-        lines.append("  nothing")
+        nothing("nothing")
     for item in blocked:
         meta = load_meta(item)
-        lines.append(f"- {meta['title']}: {meta.get('blocked_reason', 'blocked')}")
+        reason = meta.get('blocked_reason', 'blocked')
+        lines.append(f"- **{t(meta['title'])}**: {t(reason)}" if md else f"- {meta['title']}: {reason}")
         if (item / "questions.md").is_file():
             _, body = front_matter(read_text(item / "questions.md", 20000))
             for q in [l for l in body.splitlines() if l.strip()][:4]:
-                lines.append(f"  {q.strip()[:160]}")
-        lines.append(f"  {link('blocked/' + item.name)}")
+                q = q.strip()[:160]
+                sub(t(re.sub(r"^(\d+[.)]|[-*+]|#+)\s+", "", q)) if md else q)
+        sub(link('blocked/' + item.name))
     lines.append("")
 
     grouped = {}
@@ -1704,18 +1780,18 @@ def build_digest(cfg, repo, state):
         key = (p["stage"], p.get("item") or "", p["problem"])
         first, count = grouped.get(key, (p["at"], 0))
         grouped[key] = (first, count + 1)
-    lines.append(f"PROBLEMS ({len(grouped)})")
+    head(f"PROBLEMS ({len(grouped)})")
     if not grouped:
-        lines.append("  none")
+        nothing("none")
     for (stage, item_name, text), (first, count) in list(grouped.items())[-20:]:
         times = f" (x{count})" if count > 1 else ""
-        lines.append(f"- {first[11:16]} [{stage}] {item_name} {text}{times}".replace("  ", " "))
+        lines.append("- " + t(f"{first[11:16]} [{stage}] {item_name} {text}{times}".replace("  ", " ")))
     lines.append("")
 
     rows = [r for r in state.ledger() if r.get("shift") == sid]
-    lines.append(f"LAST NIGHT (shift {sid})")
+    head(f"LAST NIGHT (shift {sid})")
     if not rows:
-        lines.append("  no runs")
+        nothing("no runs")
     for tier in TIERS:
         tier_rows = [r for r in rows if r.get("tier") == tier]
         if not tier_rows:
@@ -1727,10 +1803,15 @@ def build_digest(cfg, repo, state):
     for r in rows:
         outcomes[r.get("outcome")] = outcomes.get(r.get("outcome"), 0) + 1
     if outcomes:
-        lines.append("  outcomes: " + ", ".join(f"{k} {v}" for k, v in sorted(outcomes.items())))
+        text = "outcomes: " + ", ".join(f"{k} {v}" for k, v in sorted(outcomes.items()))
+        lines.append(f"- {text}" if md else f"  {text}")
     lines.append("")
-    lines.append("Reply by adding review.md to an item folder: verdict approve, rework or reject "
-                 "(retry or reject in blocked/).")
+    if md:
+        lines.append("To answer, add `review.md` to an item folder: verdict approve, rework or reject "
+                     "(retry or reject in `blocked/`).")
+    else:
+        lines.append("Reply by adding review.md to an item folder: verdict approve, rework or reject "
+                     "(retry or reject in blocked/).")
     return "\n".join(lines) + "\n"
 
 
@@ -1780,6 +1861,20 @@ def send_mail(cfg, subject, body):
     return None
 
 
+def write_digest_file(cfg, repo, state, name):
+    """Put the digest in the queue repo. Returns None, or the error as text."""
+    try:
+        if (repo.path / name).is_dir() and not (repo.path / name).is_symlink():
+            return f"{name} is a folder in the queue repo"
+        write_file(repo.path / name, build_digest(cfg, repo, state, md=True))
+        repo.commit(f"workq: digest {now(cfg):%Y-%m-%d %H:%M}")
+        if not repo.push():
+            return f"could not push {name} to the queue repo"
+    except (OSError, subprocess.SubprocessError, WorkqError) as exc:
+        return f"could not write {name}: {exc}"
+    return None
+
+
 def digest(cfg, to_stdout=False):
     state = State(cfg)
     with Lock(state, "digest") as got:
@@ -1790,17 +1885,31 @@ def digest(cfg, to_stdout=False):
         body = build_digest(cfg, repo, state)
         stamp = now(cfg).isoformat()
         dcfg = cfg["digest"]
-        if to_stdout or not dcfg.get("to"):
+        target = digest_file(cfg)
+        if to_stdout or not (dcfg.get("to") or target):
             print(body)
             return 0
-        error = send_mail(cfg, f"{dcfg['subject']} {now(cfg):%a %d %b}", body)
-        if error:
-            state.problem("digest", None, f"send failed: {error[:300]}")
+        errors = []
+        if target:
+            error = write_digest_file(cfg, repo, state, target)
+            if error:
+                errors.append(("digest not written: " + error, "digest not written: " + error))
+            else:
+                log(f"digest written to {target} in the queue repo")
+        if dcfg.get("to"):
+            error = send_mail(cfg, f"{dcfg['subject']} {now(cfg):%a %d %b}", body)
+            if error:
+                errors.append(("send failed: " + error, "digest not sent: " + error))
+            else:
+                log(f"digest sent to {dcfg['to']}")
+        if errors:
+            for problem, _ in errors:
+                state.problem("digest", None, problem[:300])
             print(body)
-            print(f"workq: digest not sent: {error}", file=sys.stderr)
+            for _, shown in errors:
+                print(f"workq: {redact(shown)}", file=sys.stderr)
             return 1
         state.set_last_digest(stamp)
-        log(f"digest sent to {dcfg['to']}")
         return 0
 
 
@@ -2291,8 +2400,14 @@ def cmd_doctor(cfg, live=False):
     else:
         warn(f"no timezone in the config; using this machine's ({system_timezone() or 'unknown'})")
     smtp = cfg["digest"]["smtp"]
+    target = digest_file(cfg)
+    if target:
+        ok(f"digest is written to {target} in the queue repo"
+           + ("" if cfg["digest"].get("to") else " (no email: digest.to is empty)"))
     if not cfg["digest"].get("to"):
-        warn("digest.to is empty: the digest is printed, not emailed")
+        if not target:
+            warn("digest.to is empty and digest.repo_file is off: the digest goes nowhere. "
+                 "Read it with `workq digest --stdout`")
     elif smtp.get("host"):
         ok(f"digest goes to {cfg['digest']['to']} through {smtp['host']}:{smtp.get('port')}")
     else:
@@ -2371,7 +2486,6 @@ def main(argv=None):
     p.add_argument("action", choices=["show", "on", "off"])
     p.add_argument("--scheduler", choices=["auto", "systemd", "cron"], default="auto")
     args = parser.parse_args(argv)
-    signal.signal(signal.SIGPIPE, signal.SIG_DFL)  # quiet exit when piped into head
 
     def stop(signum, _frame):
         # Unwind normally, so a running agent is stopped and its clone is unlocked.
@@ -2408,6 +2522,9 @@ def main(argv=None):
     except WorkqError as exc:
         print(f"workq: {redact(exc)}", file=sys.stderr)
         return 1
+    except BrokenPipeError:
+        quiet_stdout()   # `workq status | head`: leave quietly
+        return 0
     except Exception as exc:
         traceback.print_exc()
         print(f"workq: unexpected error: {type(exc).__name__}: {redact(exc)}", file=sys.stderr)
@@ -2416,4 +2533,9 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    code = main()
+    try:
+        sys.stdout.flush()
+    except BrokenPipeError:
+        quiet_stdout()
+    sys.exit(code)

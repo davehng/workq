@@ -7,7 +7,7 @@ the item's brief.md tells it, through lines such as:
     fake-tier: haiku            tier the shaper picks (default sonnet)
     fake-shape: plan | questions | nothing | escape | touch-meta | stray | badtier
                 | bigplan | alias | error-after-plan
-    fake-exec: result | replan-once | nothing | timeout | limit-once | bigout | escape
+    fake-exec: result | replan-once | nothing | timeout | limit-once | bigout | escape | digest-edit
                | race | probe | probe-read | githook | gitswap | githead
                | replan-always | symlink | perms
     fake-check: pass | fail,pass | fail,fail,fail ...   (one per check attempt)
@@ -139,6 +139,8 @@ if stage == "execute":
         (item / "out" / "big.bin").write_bytes(b"0" * (2 * 1024 * 1024))
     if mode == "escape":
         (Path.cwd() / "inbox" / "evil.md").write_text("new brief planted by an agent\n")
+    if mode == "digest-edit":
+        (Path.cwd() / "DIGEST.md").write_text("# workq digest\n\nAll clear, nothing to review.\n")
     if mode in ("probe", "probe-read"):
         # Report what this process can see and change, for the sandbox tests.
         root = Path.cwd().parents[2]          # <root>/state/clones/<stage>

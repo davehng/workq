@@ -12,7 +12,8 @@ The runner renames the folder to `YYYY-MM-DD-title` when the night starts.
 
 ## Decide on finished work
 
-The morning email lists items in `review/` and `blocked/`. Open the item folder, read
+The morning digest lists items in `review/` and `blocked/`. It comes by email, or as
+`DIGEST.md` at the top of this repo when email is off. Open the item folder, read
 `result.md` and `out/`, then add `review.md`:
 
 ```

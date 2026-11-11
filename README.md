@@ -1,8 +1,9 @@
-# workq 0.2.1
+# workq 0.2.2
 
 A git repo holds a queue of knowledge-work briefs. Each night a runner script on a Linux
 machine has Claude shape each brief into a plan, carry it out on the cheapest model that
-fits, and check the result. Each morning you get one email listing what is ready for review.
+fits, and check the result. Each morning a digest lists what is ready for review: by email,
+or as a file in the repo when the machine can't send mail.
 You approve, ask for rework, or reject by adding a small file to the item's folder.
 
 Design doc: https://claude.ai/artifact/UErMHjrscWhxJkd1ekApyA
@@ -19,6 +20,29 @@ Design doc: https://claude.ai/artifact/UErMHjrscWhxJkd1ekApyA
 | Config | `~/.config/workq/config.yaml` | `/etc/workq/config.yaml` |
 
 The runner, prompts and queue repo are the same in both.
+
+## What changed in 0.2.2
+
+**Email is optional.** A machine with no mail program and no SMTP relay can run workq.
+
+- Leave `digest.to` empty (`to: null`) and no mail is sent. The digest is written to
+  `DIGEST.md` at the top of the queue repo instead, and pushed like any other change. Read
+  it in the repo's web page; its links go to the item folders.
+- `digest.repo_file` sets this: `auto` (the default) writes the file only when there is no
+  email; a file name, or `true`, writes it as well as the email; `off` never writes it.
+- `workq doctor` no longer warns about an empty `digest.to`, and never looks for a mail
+  program when there is no address.
+- Without email, problems used to be repeated in every digest. Now each is reported once,
+  as with email.
+- The no-root example config now starts with email off.
+
+An install that already sends email is not changed by the upgrade.
+
+**One fix, in every version before this.** If Claude Code failed the moment it started (a
+wrong option, a refused `sudo`), the runner could be killed while handing over the prompt,
+with no message. The run then counted as one that "ended without finishing". Now the
+runner reports the failure and stops the shift, as it was meant to. `workq night | head`
+no longer stops the shift either: the shift carries on without printing.
 
 ## What changed in 0.2.1
 
@@ -131,8 +155,8 @@ Nothing else is needed: no Python packages, no mail program, no sudo.
    token in `~/.config/workq/claude.env` as `CLAUDE_CODE_OAUTH_TOKEN=...`. The runner gives
    it to the Claude process only.
 
-5. **Config.** Edit `~/.config/workq/config.yaml`: `repo_url`, `web_url`, the `digest`
-   section and the caps. Every setting is explained in the file. For a company proxy or
+5. **Config.** Edit `~/.config/workq/config.yaml`: `repo_url`, `web_url` and the caps.
+   Email is off to start with; see "The digest without root" below. Every setting is explained in the file. For a company proxy or
    certificate bundle, use the `env:` section.
 
 6. **Check.** `workq doctor --live` tests each part and makes one tiny real call to Claude.
@@ -141,7 +165,7 @@ Nothing else is needed: no Python packages, no mail program, no sudo.
 7. **Fill the repo.** `workq init` (skip if the queue repo is already set up).
 
 8. **Run one shift by hand.** `workq add "Title" -m "..."`, then `workq night`. It ends when
-   the queue is empty. Then `workq digest`.
+   the queue is empty. Then `workq digest`, and look for `DIGEST.md` in the repo (or your inbox).
 
 9. **Turn on the schedule.** `workq schedule on`, and `workq schedule show` to see it.
 
@@ -171,8 +195,15 @@ extra_shifts:
 
 Caps are counted from one 22:00 to the next, so every shift in that day shares them.
 
-### Mail without root
+### The digest without root
 
+With `digest.to` empty, which is how the config starts, no mail is sent and none of the
+mail settings matter. Each digest run writes `DIGEST.md` at the top of the queue repo and
+pushes it. Bookmark that file in the repo's web page. The file is replaced each time; git
+history keeps the old ones. Agents can't change it: the runner throws away anything an
+agent writes outside its own files.
+
+To get email as well, or instead, set `digest.to` to your address and pick a route.
 Set `digest.smtp.host` and the digest is sent by the runner itself; no mail program is
 needed. For a server that needs sign-in, set `user` and put the password alone in a
 private file named by `password_file`. A sign-in is only made over an encrypted
@@ -225,7 +256,9 @@ For a VM you control. Ubuntu, Debian, or RHEL 9 and its rebuilds.
    `/etc/workq/agent.env` as `CLAUDE_CODE_OAUTH_TOKEN=...`.
 6. **Config.** `sudo nano /etc/workq/config.yaml`: set `repo_url`, `web_url`, the `digest`
    section, and look over the caps.
-7. **Mail.** Either set `digest.smtp` in the config, or use `msmtp` (apt systems): create
+7. **Mail.** Optional: with `digest.to: null` the digest is written to `DIGEST.md` in the
+   queue repo and this step can be skipped. For email, either set `digest.smtp` in the
+   config, or use `msmtp` (apt systems): create
    `/home/workq/.msmtprc`, then
    `sudo chown workq:workq /home/workq/.msmtprc && sudo chmod 600 /home/workq/.msmtprc`.
    For Gmail, make an app password first:
@@ -248,7 +281,7 @@ For a VM you control. Ubuntu, Debian, or RHEL 9 and its rebuilds.
    ```bash
    sudo systemctl start workq@night        # a full shift; ends when the queue is empty
    journalctl -u workq@night -e            # what it did
-   sudo systemctl start workq@digest       # the email
+   sudo systemctl start workq@digest       # the digest
    ```
 10. **Turn on the timers.**
     `sudo systemctl enable --now workq-night.timer workq-digest.timer`
@@ -310,6 +343,7 @@ $WQ run file && $WQ status
 | You want to | Do this |
 | --- | --- |
 | Ask for work | Add `inbox/<name>/brief.md` (or `inbox/<name>.md`) in the web UI, or `workq add "Title" -m "..."` |
+| See what is ready | Read the digest email, or `DIGEST.md` at the top of the repo when email is off |
 | Approve | Add `review.md` to the item in `review/`, containing the line `verdict: approve` |
 | Ask for changes | `verdict: rework`, with your notes on the lines below |
 | Answer a blocked item | Edit `brief.md` if needed, then `review.md` with `verdict: retry` and notes |
@@ -328,7 +362,7 @@ Verdicts are acted on at the start of the next shift.
 | `workq add TITLE [-m TEXT] [-f FILE]` | Add a brief to `inbox/` |
 | `workq run STAGE` | One run of `file`, `shape`, `exec-haiku`, `exec-sonnet`, `exec-opus` or `check` |
 | `workq night [--until HH:MM]` | A shift: all stages in turn until nothing moves, a cap, or the end time |
-| `workq digest [--stdout]` | Send (or print) the digest email |
+| `workq digest [--stdout]` | Build the digest: email it, write `DIGEST.md` in the repo, or both. `--stdout` only prints it |
 | `workq status` | Items per folder and runs against the caps |
 | `workq schedule show\|on\|off` | No-root install: set up, show or remove the timers |
 | `workq pause` / `workq resume` | Add or remove `PAUSE` |
@@ -382,13 +416,14 @@ Run `workq doctor` first. Common cases on a locked-down machine:
 | Nothing ran overnight, systemd timers | Lingering is off: `workq schedule show` says so |
 | Nothing ran overnight, cron | Check `crontab -l` and `~/.local/state/workq/logs/cron.log`; the cron service may be stopped |
 | `Permission denied` running `workq` itself | The home folder is mounted `noexec`. This install can't work there; ask for a folder that allows programs |
-| Digest not sent | The reason is printed and is in the next digest's Problems section |
+| Digest not sent, or `DIGEST.md` not written | The reason is printed and is in the next digest's Problems section |
+| No digest anywhere | `digest.to` is empty and `digest.repo_file` is `off`: `workq doctor` says so |
 
 ## What was tested, and what wasn't
 
 Tested:
 
-- 67 end-to-end tests with a fake `claude` against a local git repo. They pass on Python
+- 86 end-to-end tests with a fake `claude` against a local git repo. They pass on Python
   3.13 with system PyYAML and on Python 3.9 with the bundled PyYAML, as root and as an
   unprivileged user. They cover the queue stages, the guard, caps, usage limits, the
   stripped environment, the sandbox (home, `/tmp`, config and state hidden; `.git` and the
@@ -404,6 +439,13 @@ Tested:
   `meta.yaml`, a run that ends in an error after writing its file, the size cap, tokens in
   `repo_url`, a crontab block with its end marker missing, bad reset times, and a changed
   git ref.
+- New in 0.2.2, 16 tests cover the digest without email: the file is written and pushed
+  with no mail program run, problems are reported once, links with and without `web_url`,
+  email alone, email and file together, neither, `--stdout`, bad file names, text from
+  briefs that tries to add links or HTML, `doctor`, a shift after the file exists, an
+  agent that edits the file, a refused push, and a folder or a link in the file's place.
+  Three more cover the fix: a Claude that exits before reading its prompt, `status` into a
+  closed pipe, and a shift whose output nobody reads.
 - `install.sh` on Ubuntu 24.04 with the real `workq` and `workq-agent` users: three briefs
   through a shift; the agent user tried to list the state folder, write the ledger, make
   files, edit git config in its own and another clone, and read a clone at rest, and each

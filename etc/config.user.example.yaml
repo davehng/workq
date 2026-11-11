@@ -97,11 +97,18 @@ git:
   # For HTTPS: a private file holding one line, https://anything:TOKEN@dev.azure.com
   credential_file: null
 
+# The digest: what is ready for review, what is blocked, and what went wrong.
+# Email is optional. With `to` empty, the digest is written to DIGEST.md at the top of the
+# queue repo, and you read it in the repo's web page.
 digest:
-  to: you@example.com
+  to: null                         # an address, or null for no email
+  # auto = write DIGEST.md only when there is no email; a file name (or true) = always
+  # write it, as well as any email; off = never.
+  repo_file: auto
+  at: "06:30"                      # when `workq schedule on` runs the morning digest
+  # The rest is used only when `to` is set.
   from: workq@example.com
   subject: workq digest
-  at: "06:30"                      # when `workq schedule on` sends the morning digest
   # Route 1, built in: send through an SMTP server. Needs no mail program installed.
   smtp:
     host: null                     # e.g. smtp.example.com; null = use send_command instead

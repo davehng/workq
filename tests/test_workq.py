@@ -1286,5 +1286,250 @@ class FixesIn021Tests(unittest.TestCase):
             self.assertEqual(folder, "review")
 
 
+class DigestWithoutMailTests(unittest.TestCase):
+    """0.2.2: email is optional. With none set, the digest is a file in the queue repo."""
+
+    NO_MAIL = {"to": None, "send_command": "/nonexistent/sendmail -t"}
+
+    def setUp(self):
+        self.envs = []
+
+    def tearDown(self):
+        for e in self.envs:
+            e.cleanup()
+
+    def make(self, **overrides):
+        e = Env(**overrides)
+        self.envs.append(e)
+        return e
+
+    def log_subjects(self, e):
+        return subprocess.run(["git", "log", "--format=%s"], cwd=e.clone(), capture_output=True,
+                              text=True, check=True).stdout.splitlines()
+
+    def test_no_email_writes_the_digest_to_the_repo(self):
+        e = self.make(digest=self.NO_MAIL)
+        e.add("Digest me", "fake-tier: haiku")
+        e.add("Stuck", "fake-shape: questions")
+        e.night()
+        proc = e.workq("digest")
+        self.assertIn("digest written to DIGEST.md", proc.stdout + proc.stderr)
+        self.assertFalse(e.mail.exists())                       # no mail program was run
+        text = (e.clone() / "DIGEST.md").read_text()
+        self.assertTrue(text.startswith("# workq digest, "))
+        self.assertRegex(text, r"Written at \d\d:\d\d")
+        self.assertIn("1 for review, 1 blocked, 0 waiting in inbox", text)
+        self.assertIn("## For review (1)", text)
+        self.assertIn("- **Digest me** (haiku, new)", text)
+        self.assertIn("Supplier B is cheapest", text)
+        self.assertRegex(text, r"\[review/\S+-digest-me\]\(https://example\.test/q/tree/main/review/\S+-digest-me\)")
+        self.assertIn("## Blocked (1)", text)
+        self.assertIn("shaper has questions", text)
+        self.assertIn("## Last night (shift ", text)
+        self.assertIn("- opus: 3/15 runs", text)
+        self.assertIn("add `review.md`", text)
+        self.assertTrue(any(l.startswith("workq: digest ") for l in self.log_subjects(e)))
+
+    def test_problems_are_reported_once_without_email(self):
+        e = self.make(digest=self.NO_MAIL)
+        e.add("Wanders", "fake-tier: haiku", "fake-exec: escape")
+        e.night()
+        e.workq("digest")
+        first = (e.clone() / "DIGEST.md").read_text()
+        self.assertNotIn("## Problems (0)", first)
+        e.workq("digest")
+        self.assertIn("## Problems (0)", (e.clone() / "DIGEST.md").read_text())
+
+    def test_links_stay_inside_the_repo_when_there_is_no_web_url(self):
+        e = self.make(digest=self.NO_MAIL, web_url="")
+        e.add("Digest me", "fake-tier: haiku")
+        e.night()
+        e.workq("digest")
+        text = (e.clone() / "DIGEST.md").read_text()
+        self.assertRegex(text, r"\[(review/\S+-digest-me)\]\(\1\)")
+
+    def test_email_set_means_no_file_unless_asked(self):
+        e = self.make()                                          # the test default has digest.to set
+        e.workq("digest")
+        self.assertIn("Subject: workq digest", e.mail.read_text())
+        self.assertFalse((e.clone() / "DIGEST.md").exists())
+        e.set_config(digest={"repo_file": "STATUS.md"})
+        e.mail.unlink()
+        e.workq("digest")
+        self.assertIn("Subject: workq digest", e.mail.read_text())
+        work = e.clone()
+        self.assertTrue((work / "STATUS.md").is_file())
+        self.assertFalse((work / "DIGEST.md").exists())
+
+    def test_repo_file_true_writes_the_file_as_well_as_the_email(self):
+        e = self.make(digest={"repo_file": True})
+        e.workq("digest")
+        self.assertTrue(e.mail.exists())
+        self.assertTrue((e.clone() / "DIGEST.md").is_file())
+
+    def test_no_email_and_no_file_prints_and_changes_nothing(self):
+        e = self.make(digest=dict(self.NO_MAIL, repo_file=False))
+        before = self.log_subjects(e)
+        proc = e.workq("digest")
+        self.assertIn("FOR REVIEW (0)", proc.stdout)
+        self.assertEqual(self.log_subjects(e), before)
+        self.assertFalse(e.mail.exists())
+        doctor = e.workq("doctor", check=False).stdout
+        self.assertIn("the digest goes nowhere", doctor)
+
+    def test_stdout_never_writes_the_file(self):
+        e = self.make(digest=self.NO_MAIL)
+        before = self.log_subjects(e)
+        proc = e.workq("digest", "--stdout")
+        self.assertIn("FOR REVIEW (0)", proc.stdout)
+        self.assertEqual(self.log_subjects(e), before)
+
+    def test_bad_file_names_are_refused(self):
+        for name in ("../DIGEST.md", "review/DIGEST.md", "/tmp/x.md", "CLAUDE.md", "PAUSE",
+                     "inbox", ".git", "a b.md"):
+            e = self.make(digest=dict(self.NO_MAIL, repo_file="DIGEST.md"))
+            e.set_config(digest={"repo_file": name})
+            proc = e.workq("digest", check=False)
+            self.assertNotEqual(proc.returncode, 0, name)
+            self.assertIn("digest.repo_file", proc.stderr, name)
+
+    def test_text_from_briefs_cannot_add_links_or_html_to_the_file(self):
+        e = self.make(digest=self.NO_MAIL)
+        e.add("See [here](http://evil.test) <img src=x> *now*", "fake-shape: questions")
+        e.night()
+        e.workq("digest")
+        text = (e.clone() / "DIGEST.md").read_text()
+        self.assertIn(r"\[here\](http://evil.test) \<img src=x\> \*now\*", text)
+        self.assertNotIn("[here](http://evil.test)", text)
+        self.assertNotRegex(text, r"(?<!\\)<img")              # every < is escaped
+
+    def test_doctor_is_content_without_email(self):
+        e = self.make(digest=self.NO_MAIL)
+        out = e.workq("doctor", check=False).stdout
+        self.assertIn("digest is written to DIGEST.md in the queue repo (no email", out)
+        self.assertNotIn("sendmail", out)
+        self.assertFalse([l for l in out.splitlines() if "digest" in l and not l.startswith("[ok")])
+
+    def test_the_file_does_not_get_in_the_way_of_a_shift(self):
+        e = self.make(digest=self.NO_MAIL)
+        e.workq("digest")
+        e.add("After digest", "fake-tier: haiku")
+        e.night()
+        folder, _path, _meta = e.item("after-digest")
+        self.assertEqual(folder, "review")
+        e.workq("digest")
+        work = e.clone()
+        self.assertIn("**After digest**", (work / "DIGEST.md").read_text())
+        self.assertEqual(e.problems(), [])
+
+    def test_an_agent_cannot_change_the_file(self):
+        e = self.make(digest=self.NO_MAIL)
+        e.workq("digest")
+        before = (e.clone() / "DIGEST.md").read_text()
+        e.add("Meddler", "fake-tier: haiku", "fake-exec: digest-edit")
+        e.night(check=False)
+        self.assertEqual((e.clone() / "DIGEST.md").read_text(), before)
+        self.assertTrue(any("DIGEST.md" in p["problem"] for p in e.problems()))
+
+    def test_failed_push_is_reported_and_tried_again(self):
+        e = self.make(digest=self.NO_MAIL)
+        hook = e.remote / "hooks" / "pre-receive"
+        hook.write_text("#!/bin/sh\necho 'no pushes today' >&2\nexit 1\n")
+        hook.chmod(0o755)
+        proc = e.workq("digest", check=False)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("digest not written: could not push DIGEST.md", proc.stderr)
+        self.assertIn("FOR REVIEW", proc.stdout)                # the body is still printed
+        hook.unlink()
+        e.workq("digest")
+        text = (e.clone() / "DIGEST.md").read_text()
+        self.assertIn("could not push DIGEST.md", text)         # the miss shows in the next digest
+
+    def test_a_folder_with_the_same_name_is_reported(self):
+        e = self.make(digest=self.NO_MAIL)
+        e.push_file("DIGEST.md/keep.txt", "in the way\n")
+        proc = e.workq("digest", check=False)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("DIGEST.md is a folder", proc.stderr)
+
+    def test_a_link_with_the_same_name_is_replaced_not_followed(self):
+        e = self.make(digest=self.NO_MAIL)
+        victim = e.root / "victim.txt"
+        victim.write_text("keep me\n")
+        work = e.clone()
+        os.symlink(victim, work / "DIGEST.md")
+        subprocess.run(["git", "add", "-A"], cwd=work, check=True)
+        subprocess.run(["git", "-c", "user.name=o", "-c", "user.email=o@x", "commit", "-qm", "link"],
+                       cwd=work, check=True)
+        subprocess.run(["git", "push", "-q", "origin", "HEAD"], cwd=work, check=True)
+        e.workq("digest", check=False)
+        e.workq("digest")
+        self.assertEqual(victim.read_text(), "keep me\n")
+        path = e.clone() / "DIGEST.md"
+        self.assertFalse(path.is_symlink())
+        self.assertIn("# workq digest", path.read_text())
+
+    def test_schedule_still_runs_the_digest_without_email(self):
+        e = self.make(digest=self.NO_MAIL)
+        store = e.root / "crontab.txt"
+        e.tool("crontab", f'if [ "$1" = "-l" ]; then cat {store} 2>/dev/null; exit 0; fi\ncat > {store}\n')
+        e.workq("schedule", "on", "--scheduler", "cron")
+        self.assertRegex(store.read_text(), r"(?m)^30 6 \* \* \* .* digest >> ")
+
+
+class BrokenPipeTests(unittest.TestCase):
+    """A closed pipe must never kill the runner part-way through its work."""
+
+    def make(self, **overrides):
+        e = Env(**overrides)
+        self.addCleanup(e.cleanup)
+        return e
+
+    def closed_stdout(self, e, *args):
+        """Run workq with its output going to a pipe nobody reads."""
+        r, w = os.pipe()
+        os.close(r)
+        try:
+            return subprocess.run([sys.executable, str(WORKQ), *args], env=e.env, stdout=w,
+                                  stderr=subprocess.PIPE, text=True, timeout=120)
+        finally:
+            os.close(w)
+
+    def test_runner_is_not_killed_when_claude_exits_without_reading_its_prompt(self):
+        # A Claude that fails at once (bad option, sudo refusal) closes its stdin before
+        # the prompt is written. With SIGPIPE left at its default, that write killed the
+        # runner in silence. The stand-in Claude records how its parent treats SIGPIPE.
+        e = self.make()
+        seen = e.root / "sigign.txt"
+        broken = e.root / "broken-claude.sh"
+        broken.write_text(f"#!/bin/sh\ngrep SigIgn /proc/$PPID/status > {seen}\n"
+                          "echo \"error: unknown option '--restricted'\" >&2\nexit 1\n")
+        broken.chmod(0o755)
+        e.set_config(claude={"bin": str(broken), "agent_user": None, "sandbox": "off"})
+        e.add("First")
+        proc = e.night(check=False)
+        self.assertEqual(proc.returncode, 1)
+        mask = int(seen.read_text().split()[1], 16)
+        self.assertTrue(mask & (1 << (signal.SIGPIPE - 1)), "runner must ignore SIGPIPE")
+        self.assertEqual(e.item("first")[0], "inbox")
+        self.assertNotIn("running", e.item("first")[2])
+
+    def test_status_into_a_closed_pipe_leaves_quietly(self):
+        e = self.make()
+        e.add("First")
+        proc = self.closed_stdout(e, "status")
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(proc.stderr, "")
+
+    def test_shift_keeps_working_when_nobody_reads_its_output(self):
+        e = self.make()
+        e.add("First", "fake-tier: haiku")
+        until = (dt.datetime.now() + dt.timedelta(minutes=180)).strftime("%H:%M")
+        proc = self.closed_stdout(e, "night", "--until", until)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+        self.assertEqual(e.item("first")[0], "review")
+
+
 if __name__ == "__main__":
     unittest.main()

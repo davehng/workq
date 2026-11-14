@@ -1,10 +1,14 @@
-# workq 0.2.2
+# workq 1.0.0
 
 A git repo holds a queue of knowledge-work briefs. Each night a runner script on a Linux
 machine has Claude shape each brief into a plan, carry it out on the cheapest model that
 fits, and check the result. Each morning a digest lists what is ready for review: by email,
 or as a file in the repo when the machine can't send mail.
 You approve, ask for rework, or reject by adding a small file to the item's folder.
+
+At work, workq can also take tasks from a Microsoft Planner board, keep each task in step
+with its item, and send the digest through Microsoft Graph. That part is optional and off
+until you set it up.
 
 Design doc: https://claude.ai/artifact/UErMHjrscWhxJkd1ekApyA
 
@@ -20,6 +24,74 @@ Design doc: https://claude.ai/artifact/UErMHjrscWhxJkd1ekApyA
 | Config | `~/.config/workq/config.yaml` | `/etc/workq/config.yaml` |
 
 The runner, prompts and queue repo are the same in both.
+
+## What changed in 1.0
+
+**Planner and Microsoft Graph, for the work instance.** All of it is off until the config
+has a `graph` section; with none, workq behaves as 0.2.3 did.
+
+- **Intake from a Planner board.** A task on an existing team board is taken when it is in
+  the "For workq" bucket, assigned to the service account, and created by someone on
+  `planner.accept_from`. Its title, description, checklist, due date and attachments
+  become the brief.
+- **The task follows its item.** workq moves it through six buckets and comments at each
+  step, with links into Azure DevOps pinned to the commit that wrote each file. It never
+  marks a task complete; archived items go to "workq: done".
+- **Attachments reach Claude but never git.** Files attached to the task are fetched,
+  given Markdown, CSV and (with LibreOffice) PDF copies, kept in the runner's state folder,
+  and copied into the item's `refs/` folder only while a stage runs. The repo holds only
+  `refs.yaml`, listing them.
+- **Graph mail.** `digest.route: graph` sends the digest as the service account, for a
+  machine with no mail relay.
+- **Browser sign-in.** `workq graph login` signs in once as the service account; the
+  refresh token keeps it signed in. Four delegated permissions only, no application ones.
+- **Planner never holds up the queue.** Changes for Planner wait in an outbox and are sent
+  at the end of each shift pass and before each digest. A lapsed sign-in, throttling or an
+  outage only delays them.
+- **A failed email now always leaves the digest in the repo** as `DIGEST.md`, with the
+  reason at the top, whatever the route.
+- **The program is now a package.** `bin/workq` is a small entry point; the code is in
+  `lib/workq/`, and the bundled PyYAML moved to `lib/vendor/`.
+
+**Upgrading.** Unzip and run the installer again (`sudo ./install.sh` at home, or
+`./install-user.sh`). Nothing in the queue repo changes; a 0.2 queue works with 1.0 as it
+is. The home instance needs no new settings.
+
+**Different from the design doc:** the Graph token is kept in the state folder
+(`<state_dir>/graph/token.json`), not beside the config. The runner must rewrite it each
+time Graph issues a new refresh token, and on a root install `/etc/workq` is not writable
+by the `workq` user. The state folder is private to the runner, hidden by the sandbox and
+covered by the deny rules.
+
+## What changed in 0.2.3
+
+**Mail goes only to domains you list.** `digest.allowed_domains` in the config holds the
+domains the digest may be sent to:
+
+```yaml
+digest:
+  to: [david@company.com.au, ops@anothercompany.com]
+  allowed_domains: [company.com.au, anothercompany.com]
+```
+
+- Every address in `digest.to` must be in one of the listed domains, or no mail is sent at
+  all, not even to the addresses that match. The reason is printed, logged, and shown in
+  the next digest's Problems section.
+- The match is on the whole domain. `sub.company.com.au` does not match `company.com.au`,
+  and neither does `company.com.au.evil.com`. List each domain you need.
+- An empty list sends nothing. This is on purpose: mail is refused until you say where it
+  may go.
+- `digest.to` may now be a list as well as one address or a comma-separated line. A
+  display name is fine (`David <david@company.com.au>`); a comma inside a name is not.
+- Only the checked addresses are used. The mail's `To:` line is rebuilt from them, and
+  SMTP is given only them, so nothing in the setting can add another address.
+- A domain entry that isn't a plain domain name (`*.company.com.au`, `company`) stops
+  workq at start with a clear message. `workq doctor` checks the addresses too.
+- No email set (`to: null`) needs no list; the digest still goes to `DIGEST.md`.
+
+**Upgrading an install that sends email: add `allowed_domains` before the next digest.**
+Without it the digest is refused and, since a mail install doesn't write `DIGEST.md` by
+default, you won't see it. Run `workq doctor` after editing the config.
 
 ## What changed in 0.2.2
 
@@ -94,9 +166,10 @@ Fixes from a review of 0.2.0. Upgrade any 0.2.0 install; the first fix matters m
 
 | Path | What it is |
 | --- | --- |
-| `bin/workq` | The runner (Python 3.9+). Does all git work and every move. |
+| `bin/workq` | The entry point (Python 3.9+). |
+| `lib/workq/` | The runner, which does all git work and every move, and the Graph, Planner, attachment, converter and mail code behind small interfaces. |
 | `bin/agent-claude` | Two-user mode only: starts Claude as the agent user. |
-| `lib/yaml/` | PyYAML 6.0.3 (MIT licence), used when the machine has none. |
+| `lib/vendor/yaml/` | PyYAML 6.0.3 (MIT licence), used when the machine has none. |
 | `template/` | The queue repo skeleton: folders, `CLAUDE.md` house rules, the three stage prompts. |
 | `etc/` | Example configs for both modes, credential file examples, deny rules, sudo rule. |
 | `systemd/` | System units for the root install. (The no-root install writes its own.) |
@@ -203,7 +276,8 @@ pushes it. Bookmark that file in the repo's web page. The file is replaced each 
 history keeps the old ones. Agents can't change it: the runner throws away anything an
 agent writes outside its own files.
 
-To get email as well, or instead, set `digest.to` to your address and pick a route.
+To get email as well, or instead, set `digest.to` to your address, list its domain in
+`digest.allowed_domains` (mail to any other domain is refused), and pick a route.
 Set `digest.smtp.host` and the digest is sent by the runner itself; no mail program is
 needed. For a server that needs sign-in, set `user` and put the password alone in a
 private file named by `password_file`. A sign-in is only made over an encrypted
@@ -257,7 +331,8 @@ For a VM you control. Ubuntu, Debian, or RHEL 9 and its rebuilds.
 6. **Config.** `sudo nano /etc/workq/config.yaml`: set `repo_url`, `web_url`, the `digest`
    section, and look over the caps.
 7. **Mail.** Optional: with `digest.to: null` the digest is written to `DIGEST.md` in the
-   queue repo and this step can be skipped. For email, either set `digest.smtp` in the
+   queue repo and this step can be skipped. For email, list the domain of each address in
+   `digest.allowed_domains` (nothing is sent without it), then either set `digest.smtp` in the
    config, or use `msmtp` (apt systems): create
    `/home/workq/.msmtprc`, then
    `sudo chown workq:workq /home/workq/.msmtprc && sudo chmod 600 /home/workq/.msmtprc`.
@@ -289,6 +364,96 @@ For a VM you control. Ubuntu, Debian, or RHEL 9 and its rebuilds.
 **Upgrading a 0.1 or 0.2.0 install:** unzip this version and run `sudo ./install.sh`
 again. Config, credentials, keys and timers are kept, and nothing in the queue repo
 changes. The first run tightens the permissions on `/var/lib/workq`.
+
+## Planner and Microsoft Graph (work instance)
+
+Optional. Set this up after the queue itself works (`workq doctor` clean, a brief through a
+shift). Never on the home instance: work data stays in the work tenant and the work repo.
+
+### What IT sets up
+
+1. **An Entra app registration**, single tenant, with "Allow public client flows" on and
+   `http://localhost` as a redirect address (Mobile and desktop applications). No client
+   secret or certificate.
+2. **Delegated permissions only:** `Tasks.ReadWrite`, `offline_access`,
+   `Files.SelectedOperations.Selected` (admin consent) and `Mail.Send`. Sign-in also asks
+   for `openid` and `profile`, which give no access to data. Leave out
+   `Files.SelectedOperations.Selected` to run without attachments, and `Mail.Send` to keep
+   another mail route.
+3. **A service account** (for example `svc-workq`) with a licence that includes Planner and
+   an Exchange Online mailbox, no Send As or delegate rights on other mailboxes, and
+   membership of the groups whose boards workq should use, and nothing else.
+4. **A SharePoint grant:** the app gets "read" on each board's document library (or one
+   folder in it). Without it, attachments are listed in the brief but not fetched.
+5. **Recommended:** an Exchange mail flow rule that stops `svc-workq` mailing outside the
+   company, and an alert on its sign-ins from anywhere but the work VM.
+
+The design doc explains why each permission is needed, for the security review.
+
+### Config
+
+Fill in the `graph` and `planner` sections at the end of the example config (and
+`digest.route: graph` to mail through Graph). `accept_from` and `mention` take Entra object
+IDs, not addresses: find yours at myaccount.microsoft.com, under Overview.
+
+### Steps
+
+1. `workq graph login`. It prints an address. Open it in a browser on any machine and sign
+   in **as the service account**. The browser ends on an `http://localhost/?code=...`
+   address that fails to load: copy the whole address and paste it into the terminal.
+2. `workq planner setup`. It lists the buckets each plan is missing and, after you type
+   `yes`, creates them: For workq, workq: planning, workq: working, workq: for review,
+   workq: blocked, workq: done.
+3. `workq doctor`. It checks that Graph is reachable through the proxy and its certificate
+   is trusted, who is signed in (make sure it is the service account, not you), each plan,
+   its buckets, and LibreOffice.
+4. On the board: create a task in "For workq" and assign it to the service account. The
+   next shift takes it. To try it at once: `workq planner intake`, then `workq night`.
+
+### How it works
+
+| Folder | Bucket | Comment posted |
+| --- | --- | --- |
+| taken into `inbox/` | workq: planning | Taken, with a link to `brief.md` (and any attachment it could not open) |
+| `ready/` after shaping | workq: working | Planned, tier and steps, link to `plan.md` |
+| executing, checking | (stays) | Executing (tier, run n of 3); Checking the result |
+| `check/` failed, back to `ready/` | workq: working | Check failed (attempt n of 3), link to `check.md` |
+| `review/` | workq: for review | Ready for review, mentions you, links to `result.md`, `check.md`, `out/`, and the folder to add `review.md` to |
+| `blocked/` | workq: blocked | Blocked with the reason or the number of questions, mentions you |
+| back to `inbox/` after your rework or retry | workq: planning | Back in the queue with your notes |
+| `archive/` | workq: done | Approved and archived, or Rejected and archived |
+
+- **Only tasks assigned to the service account are taken**, and only from people on
+  `accept_from`. A task from anyone else gets one "Not taken" comment. A task in the bucket
+  that is not assigned is left alone, with no comment.
+- **Accepted risk:** `accept_from` checks who created the task. Planner does not record
+  who last edited it, so anyone in the team can change a listed person's task before it is
+  taken.
+- **Summaries are off**: comments say the step, counts and links, and copy no results into
+  Planner. `planner.comments.summaries: true` adds the first lines.
+- **Links** to files and `out/` are pinned to the commit that wrote them, so they open after
+  the item moves. The "add review.md here" link points at the folder as it is now.
+- **Your verdicts stay in the repo** (`review.md`). Moving a task by hand changes nothing
+  in the queue, and the next stage change moves it back.
+- **If the comments API fails** (it is a beta API), workq writes the same text into a
+  "--- workq ---" section at the end of the task's description and says so in the digest.
+- **Attachments** are fetched once, at intake, and again after your retry or rework.
+  SharePoint files of the types Claude can use are fetched (Word, Excel, PowerPoint, PDF,
+  CSV, text, Markdown, PNG, JPEG), up to 20 MB each and 50 MB an item. Web links are listed,
+  not fetched. The copies are deleted 30 days after the item is archived.
+- **If the sign-in lapses** (90 days unused, revoked, or Conditional Access), the queue runs
+  on; Planner updates wait, and the digest says to run `workq graph login`.
+- **The digest** gains a Planner line (tasks taken, updates waiting) and a link to each
+  item's task.
+
+### Where things are kept
+
+| What | Where | Who can read it |
+| --- | --- | --- |
+| Refresh token and the account | `<state_dir>/graph/token.json` | The runner only (folder 700, file 600). Hidden from Claude by the sandbox and the deny rules |
+| Every Graph call (method, path, result), 90 days | `<state_dir>/graph/calls.log` | The runner only |
+| Planner updates waiting to be sent | `<state_dir>/planner/outbox.jsonl` | The runner only |
+| Attachment files and copies | `<state_dir>/attachments/<item>/` | The runner only; copied into the item's `refs/` for each run, then deleted |
 
 ## Try it on your own machine first (about 10 minutes)
 
@@ -353,6 +518,72 @@ $WQ run file && $WQ status
 `review.md` needs the `verdict:` prefix; a bare `approve` is reported as a bad verdict.
 Verdicts are acted on at the start of the next shift.
 
+### Answering a blocked item
+
+An item lands in `blocked/` when the planner has questions (in `questions.md`) or a stage
+failed too often (the reason is in `meta.yaml` and the digest). To send it back:
+
+1. Add a new file, `review.md`, to the item's folder in `blocked/`.
+2. Make the first line `verdict: retry`.
+3. Write your answers on the lines below. Number them to match `questions.md`.
+
+```
+verdict: retry
+
+1. Use FY26 actuals, not budget.
+2. Only the Australian entities.
+3. A one-page table is enough.
+```
+
+At the start of the next shift the runner copies your answers into the item's `notes.md`,
+deletes `review.md`, resets the attempt counts and moves the item back to `inbox/`. The
+planner reads `notes.md` when it plans again, and your notes win where they differ from the
+brief.
+
+- Don't write your answers in `questions.md`. The agents don't read it as yours.
+- If the request itself has changed, edit `brief.md` in the same commit. For more than a
+  detail or two, that is better than notes, so the brief keeps saying what you want.
+- To drop the item instead, use `verdict: reject`. It is archived.
+
+### More night shifts
+
+The main shift starts at `window.start`. More starts each night help when briefs arrive
+after the first shift has finished, for example from an intake agent. A shift stops when
+the queue is empty, and a start that finds a shift still running logs
+`night shift already running` and exits, so starts never pile up.
+
+Caps reset at `window.start` and are shared by every shift until the next one. So make the
+earliest start the main one. For starts at 19:00, 22:00 and 03:00:
+
+**Without root**, in `~/.config/workq/config.yaml`:
+
+```yaml
+window:
+  start: "19:00"
+  end: "06:00"
+
+extra_shifts:
+  - {start: "22:00", until: "06:00", digest: false}
+  - {start: "03:00", until: "06:00", digest: false}
+```
+
+Then `workq schedule on` again, and `workq schedule show` to check. The 06:30 digest
+covers all three shifts, hence `digest: false`.
+
+**With root**, `extra_shifts` is not used: the system timer sets the times. Add them with
+`sudo systemctl edit workq-night.timer`:
+
+```
+[Timer]
+OnCalendar=*-*-* 19:00
+OnCalendar=*-*-* 03:00
+```
+
+These add to the 22:00 already in the timer. Then `sudo systemctl daemon-reload` and
+`systemctl list-timers 'workq*'` to check. Set `window.start: "19:00"` in
+`/etc/workq/config.yaml` too, so caps reset at 19:00. The timer uses the VM's own time
+zone, not the config's.
+
 ## Commands
 
 | Command | Does |
@@ -366,6 +597,11 @@ Verdicts are acted on at the start of the next shift.
 | `workq status` | Items per folder and runs against the caps |
 | `workq schedule show\|on\|off` | No-root install: set up, show or remove the timers |
 | `workq pause` / `workq resume` | Add or remove `PAUSE` |
+| `workq graph login` / `logout` | Sign in to Microsoft Graph as the service account, or delete the token |
+| `workq planner setup [--yes]` | Create the buckets a plan is missing, after a yes |
+| `workq planner status` | Each plan's buckets, and the Planner updates waiting |
+| `workq planner sync` | Send waiting Planner updates now |
+| `workq planner intake` | Take new Planner tasks now, without waiting for a shift |
 
 The config is found at `$WORKQ_CONFIG`, then `~/.config/workq/config.yaml`, then
 `/etc/workq/config.yaml`. On a root install, run commands as the `workq` user:
@@ -417,15 +653,22 @@ Run `workq doctor` first. Common cases on a locked-down machine:
 | Nothing ran overnight, cron | Check `crontab -l` and `~/.local/state/workq/logs/cron.log`; the cron service may be stopped |
 | `Permission denied` running `workq` itself | The home folder is mounted `noexec`. This install can't work there; ask for a folder that allows programs |
 | Digest not sent, or `DIGEST.md` not written | The reason is printed and is in the next digest's Problems section |
+| Mail refused: "not in an allowed domain" or "allowed_domains is empty" | Add the address's domain to `digest.allowed_domains`, then `workq doctor` |
 | No digest anywhere | `digest.to` is empty and `digest.repo_file` is `off`: `workq doctor` says so |
+| "Graph sign-in has expired" | Run `workq graph login` and sign in as the service account again |
+| Graph: "TLS certificate not trusted" | The proxy inspects TLS: set `graph.ca_file` to its certificate |
+| A Planner task isn't taken | It must be in the intake bucket, assigned to the service account, and created by someone on `accept_from`; not complete. `workq planner intake` shows the reason in the log |
+| "bucket ... is missing" | Run `workq planner setup` |
+| Comments appear in the task description | The beta comments API failed; the reason is in the digest's Problems |
+| Attachment "could not open" | The file is outside the libraries granted to the app, encrypted by a sensitivity label, or too big |
 
 ## What was tested, and what wasn't
 
 Tested:
 
-- 86 end-to-end tests with a fake `claude` against a local git repo. They pass on Python
-  3.13 with system PyYAML and on Python 3.9 with the bundled PyYAML, as root and as an
-  unprivileged user. They cover the queue stages, the guard, caps, usage limits, the
+- 183 tests. They pass on Python 3.13 with system PyYAML and on Python 3.9 with the
+  bundled PyYAML. The 99 end-to-end tests from 0.2.3 run unchanged, with a fake `claude`
+  against a local git repo, as root and as an unprivileged user. They cover the queue stages, the guard, caps, usage limits, the
   stripped environment, the sandbox (home, `/tmp`, config and state hidden; `.git` and the
   system read-only), `.git` locking and swap detection, hooks never run, the token file for
   HTTPS, built-in SMTP against a local test server, cron and systemd scheduling against
@@ -446,6 +689,29 @@ Tested:
   agent that edits the file, a refused push, and a folder or a link in the file's place.
   Three more cover the fix: a Claude that exits before reading its prompt, `status` into a
   closed pipe, and a shift whose output nobody reads.
+- New in 0.2.3, 13 tests cover the mail allowlist: one and several domains and addresses,
+  the list as a comma line, an address outside the list, one bad address among good ones,
+  lookalike and sub-domains, tricks in the address (two `@`, a quoted fake address, an
+  added header line), an empty list, bad list entries, SMTP given only the checked
+  addresses, SMTP not contacted at all when refused, `doctor`, and no email needing no list.
+- New in 1.0, 84 tests cover Planner and Graph. Unit tests use fakes of each interface:
+  every comment and its links and bucket, escaping of hostile text, summaries off, quiet,
+  the outbox (newest move only, sign-in, throttling and network stopping the sync, gone
+  tasks dropped, conflicts kept, old lines dropped, the description fallback), intake
+  (bucket, assignment, `accept_from`, refusal posted once, never twice, case in IDs), the
+  brief, attachments (types, caps, encrypted files, `refs/` placing and removal, cleanup),
+  the Word, Excel and PowerPoint converters, a DTD refused, and a real LibreOffice PDF.
+  The same contract tests run against the fake board and the Graph board on a stand-in
+  Graph and sign-in server: buckets, tasks, details, moves, comments with and without a
+  mention, the description note. Against that server: browser sign-in with PKCE, a wrong
+  state, verifier or pasted address, token rotation, a revoked token, retries and waits on
+  429 and 503, one fresh token after a 401, every error kind, the token never sent off
+  Graph or with a download, the call log, and Graph mail. End to end, the real program ran
+  a task round the whole loop (intake, attachments in `refs/` but never in git history,
+  every comment and bucket, the digest, approval to "workq: done"), questions then a retry
+  that fetched a changed file again, an expired sign-in with the queue running on, the
+  comments API down, quiet and summaries, Graph mail and the `DIGEST.md` fallback,
+  `doctor`, config checks, logout, and the token hidden from Claude inside bubblewrap.
 - `install.sh` on Ubuntu 24.04 with the real `workq` and `workq-agent` users: three briefs
   through a shift; the agent user tried to list the state folder, write the ledger, make
   files, edit git config in its own and another clone, and read a clone at rest, and each
@@ -474,3 +740,10 @@ Not tested:
 - Real models as an unprivileged user inside the sandbox (the real run was as root; the
   unprivileged runs used the fake `claude`).
 - A real usage limit (the wording Claude Code uses was simulated).
+- **Real Microsoft Graph and Entra.** The stand-in server was written from Microsoft's
+  documentation, not recorded from the real service. Not tried: the beta Planner comments
+  API and its mentions, a delegated `Files.SelectedOperations.Selected` token following a
+  SharePoint sharing link, Azure DevOps opening a folder link pinned to a commit, the
+  `task_link` address format, Conditional Access, and sign-in through the work proxy.
+  These are for the trial after deployment.
+- LibreOffice on RHEL 9 (it was tested on Ubuntu).

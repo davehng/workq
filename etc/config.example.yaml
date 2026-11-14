@@ -64,9 +64,14 @@ caps:
 # a file name (or true) = always write it, as well as the email; off = never.
 digest:
   to: you@example.com
+  # Mail goes only to addresses in these domains. Every address in `to` must match one
+  # exactly (sub.example.com does not match example.com), or nothing is sent.
+  # Empty = no mail is sent at all.
+  allowed_domains: [example.com]
   repo_file: auto
   from: workq@example.com
   subject: workq digest
+  route: auto                  # auto, smtp, command, or graph (see the graph section)
   # Route 1: any command that reads a full message on stdin.
   send_command: msmtp -t
   # Route 2, built in: set smtp.host and the command above is not used. Needs no mail
@@ -82,3 +87,48 @@ digest:
 git:
   author_name: workq
   author_email: workq@example.com
+
+# ---------------------------------------------------------------- Microsoft Graph (work only)
+# Sign-in for the Planner link and for sending the digest through Graph. Leave tenant and
+# client_id empty and nothing below is used. See "Planner and Microsoft Graph" in README.md.
+graph:
+  tenant: null                  # e.g. perenti.onmicrosoft.com, or the tenant ID
+  client_id: null               # the app registration's Application (client) ID
+  token_file: null              # default: <state_dir>/graph/token.json, private to the runner
+  # Only if the company proxy inspects TLS with a certificate not in the system store:
+  ca_file: null                 # e.g. /etc/pki/tls/certs/company-proxy.pem
+
+planner:
+  enabled: false
+  # The only plans workq may touch. The plan ID is in the plan's address in Planner.
+  plans:
+    - id: PLAN-ID
+      name: Finance systems     # for the digest and messages only
+      # buckets: the six names, if you want others than these defaults
+      #   intake: For workq
+      #   planning: "workq: planning"
+      #   working: "workq: working"
+      #   review: "workq: for review"
+      #   blocked: "workq: blocked"
+      #   done: "workq: done"
+  # A task is taken only if it is in the intake bucket, assigned to the signed-in
+  # service account, and created by one of these people. Entra object IDs, not
+  # addresses: find yours at myaccount.microsoft.com (Overview, "Object ID").
+  accept_from: []
+  # Mentioned in the review and blocked comments. An object ID; must be in the plan.
+  mention: null
+  comments:
+    enabled: true
+    quiet: false                # true = no comment for the executing and checking steps
+    summaries: false            # true = also post first lines of results and checks, and the questions
+  # How links into the queue repo are made. workq fills in {path}, {commit} and {branch}.
+  links:
+    file: "https://dev.azure.com/ORG/PROJECT/_git/workq-queue?path=/{path}&version=GC{commit}"
+    folder: "https://dev.azure.com/ORG/PROJECT/_git/workq-queue?path=/{path}&version=GC{commit}"
+    current: "https://dev.azure.com/ORG/PROJECT/_git/workq-queue?path=/{path}&version=GB{branch}"
+  task_link: "https://tasks.office.com/{tenant}/Home/Task/{task}"   # the digest's link to a task
+  attachments:
+    enabled: true               # needs Files.SelectedOperations.Selected and a library grant
+    max_file_mb: 20
+    max_item_mb: 50
+    keep_days: 30               # after archiving, then the copies are deleted

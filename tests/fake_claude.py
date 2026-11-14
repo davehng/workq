@@ -9,7 +9,7 @@ the item's brief.md tells it, through lines such as:
                 | bigplan | alias | error-after-plan
     fake-exec: result | replan-once | nothing | timeout | limit-once | bigout | escape | digest-edit
                | race | probe | probe-read | githook | gitswap | githead
-               | replan-always | symlink | perms
+               | replan-always | symlink | perms | refs
     fake-check: pass | fail,pass | fail,fail,fail ...   (one per check attempt)
 
 Every call's arguments are appended to $FAKE_CLAUDE_LOG as one JSON line.
@@ -28,7 +28,7 @@ try:
         raise ImportError
     import yaml
 except ImportError:
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib" / "vendor"))
     import yaml
 
 argv = sys.argv[1:]
@@ -172,6 +172,23 @@ if stage == "execute":
         lines.append("token=" + os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "none"))
         (item / "out").mkdir(exist_ok=True)
         (item / "out" / "probe.txt").write_text("\n".join(lines) + "\n")
+    if mode == "refs":
+        # Report the attachment copies this run was given, for the Planner tests.
+        refs = item / "refs"
+        root = Path.cwd().parents[2]
+        seen = sorted(p.name for p in refs.iterdir()) if refs.is_dir() else []
+        lines = ["refs=" + ",".join(seen),
+                 "graph_token=" + ("visible" if (root / "state" / "graph" / "token.json").exists() else "hidden")]
+        md = next((p for p in seen if p.endswith(".docx.md")), None)
+        if md:
+            lines.append("docx_md=" + (refs / md).read_text().replace("\n", " ")[:200])
+        try:
+            (refs / "planted.txt").write_text("x")
+            lines.append("refs_write=allowed")
+        except OSError:
+            lines.append("refs_write=blocked")
+        (item / "out").mkdir(exist_ok=True)
+        (item / "out" / "refs-seen.txt").write_text("\n".join(lines) + "\n")
     if mode == "githook":
         hook = Path.cwd() / ".git" / "hooks" / "post-commit"
         try:

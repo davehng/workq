@@ -34,7 +34,7 @@ try:
         raise ImportError
     import yaml
 except ImportError:
-    sys.path.insert(0, str(PKG / "lib"))
+    sys.path.insert(0, str(PKG / "lib" / "vendor"))
     import yaml
 
 
@@ -81,7 +81,7 @@ class Env:
                        "pass_env": ["FAKE_CLAUDE_LOG", "FAKE_CLAUDE_STATE", "FAKE_REMOTE",
                                     "FAKE_HELP_FLAGS", "WORKQ_BUNDLED_YAML"]},
             "digest": {"to": "me@example.test", "from": "workq@example.test",
-                       "send_command": str(sendmail)},
+                       "allowed_domains": ["example.test"], "send_command": str(sendmail)},
         }
         for key, value in overrides.items():
             if isinstance(value, dict) and isinstance(cfg.get(key), dict):
@@ -556,6 +556,7 @@ class TinySMTP(threading.Thread):
         self.port = self.sock.getsockname()[1]
         self.data = ""
         self.commands = []
+        self.lines = []
 
     def run(self):
         conn, _ = self.sock.accept()
@@ -577,6 +578,7 @@ class TinySMTP(threading.Thread):
                     self.data += line + "\n"
                 continue
             self.commands.append(line.split(" ")[0].upper())
+            self.lines.append(line)
             if line.upper().startswith(("EHLO", "HELO")):
                 say("250 tiny")
             elif line.upper() == "DATA":
@@ -1529,6 +1531,120 @@ class BrokenPipeTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertNotIn("Traceback", proc.stderr)
         self.assertEqual(e.item("first")[0], "review")
+
+
+class MailAllowlistTests(unittest.TestCase):
+    """0.2.3: mail goes only to addresses in digest.allowed_domains."""
+
+    DOMAINS = ["company.com.au", "anothercompany.com"]
+
+    def make(self, to, domains=DOMAINS, **digest):
+        e = Env(digest=dict({"to": to, "allowed_domains": domains}, **digest))
+        self.addCleanup(e.cleanup)
+        return e
+
+    def sent_to(self, e):
+        """Run the digest. Returns (proc, the To: line of the mail sent, or None)."""
+        proc = e.workq("digest", check=False)
+        if not e.mail.exists():
+            return proc, None
+        line = next(x for x in e.mail.read_text().splitlines() if x.startswith("To:"))
+        return proc, line[3:].strip()
+
+    def assert_refused(self, to, domains=DOMAINS, why="not in an allowed domain"):
+        e = self.make(to, domains)
+        proc, sent = self.sent_to(e)
+        self.assertIsNone(sent, f"mail went to {sent}")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn(why, proc.stderr)
+        self.assertTrue(any(why in p["problem"] for p in e.problems()))   # shows in the next digest
+        self.assertIn("FOR REVIEW", proc.stdout)                           # the body is still printed
+        return e
+
+    def test_address_in_an_allowed_domain_is_sent(self):
+        proc, sent = self.sent_to(self.make("david@company.com.au"))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(sent, "david@company.com.au")
+
+    def test_several_domains_and_several_addresses(self):
+        e = self.make(["David <David@COMPANY.com.au>", "ops@anothercompany.com"])
+        proc, sent = self.sent_to(e)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(sent, "David@company.com.au, ops@anothercompany.com")
+
+    def test_domains_as_a_comma_string_with_at_signs_and_capitals(self):
+        proc, sent = self.sent_to(self.make("a@anothercompany.com", "@Company.com.au, AnotherCompany.com"))
+        self.assertEqual(sent, "a@anothercompany.com")
+
+    def test_address_outside_the_list_is_refused(self):
+        self.assert_refused("me@gmail.com")
+
+    def test_one_bad_address_stops_the_whole_mail(self):
+        self.assert_refused("david@company.com.au, me@gmail.com")
+
+    def test_lookalike_domains_are_refused(self):
+        for to in ("d@company.com.au.evil.com", "d@evilcompany.com.au", "d@sub.company.com.au",
+                   "d@company.com", "d@company.com.au."[:-1] + "x"):
+            with self.subTest(to=to):
+                self.assert_refused(to)
+
+    def test_tricks_in_the_address_are_refused(self):
+        for to in ("d@evil.com@company.com.au", '"d@company.com.au" <d@evil.com>',
+                   "d@company.com.au\nBcc: e@evil.com", "notanaddress", "<>"):
+            with self.subTest(to=to):
+                e = self.make(to)
+                proc, sent = self.sent_to(e)
+                self.assertIsNone(sent, f"{to!r} went to {sent}")
+                self.assertEqual(proc.returncode, 1)
+                self.assertIn("mail not sent", proc.stderr)
+
+    def test_empty_list_sends_nothing(self):
+        for domains in ([], None):
+            with self.subTest(domains=domains):
+                self.assert_refused("david@company.com.au", domains, why="allowed_domains is empty")
+
+    def test_bad_list_entry_stops_with_a_clear_message(self):
+        for entry in ("*.company.com.au", "company", "company.com.au/x", "me@"):
+            with self.subTest(entry=entry):
+                e = self.make("david@company.com.au")
+                e.set_config(digest={"allowed_domains": [entry]})
+                proc = e.workq("status", check=False)
+                self.assertEqual(proc.returncode, 1)
+                self.assertIn("digest.allowed_domains", proc.stderr)
+
+    def test_smtp_is_given_only_the_checked_addresses(self):
+        server = TinySMTP()
+        server.start()
+        e = self.make("David <david@company.com.au>",
+                      smtp={"host": "127.0.0.1", "port": server.port, "starttls": False})
+        e.workq("digest")
+        server.join(timeout=10)
+        rcpt = [x for x in server.lines if x.upper().startswith("RCPT")]
+        self.assertEqual([x.lower() for x in rcpt], ["rcpt to:<david@company.com.au>"])
+
+    def test_smtp_is_not_contacted_for_a_refused_address(self):
+        server = TinySMTP()
+        server.start()
+        e = self.make("me@gmail.com", smtp={"host": "127.0.0.1", "port": server.port, "starttls": False})
+        proc = e.workq("digest", check=False)
+        self.assertEqual(proc.returncode, 1)
+        server.sock.close()
+        self.assertEqual(server.commands, [])
+
+    def test_doctor_reports_the_check(self):
+        e = self.make("me@gmail.com")
+        out = e.workq("doctor", check=False).stdout
+        self.assertIn("me@gmail.com is not in an allowed domain", out)
+        e2 = self.make("david@company.com.au", [])
+        self.assertIn("allowed_domains is empty", e2.workq("doctor", check=False).stdout)
+        e3 = self.make("david@company.com.au")
+        self.assertIn("digest goes to david@company.com.au", e3.workq("doctor", check=False).stdout)
+
+    def test_no_email_needs_no_list(self):
+        e = self.make(None, [], send_command="/nonexistent/sendmail -t")
+        proc = e.workq("digest", check=False)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue((e.clone() / "DIGEST.md").is_file())
 
 
 if __name__ == "__main__":
